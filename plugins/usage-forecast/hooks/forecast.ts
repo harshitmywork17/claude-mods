@@ -53,13 +53,18 @@ export function outlook(history: readonly number[], reading: Reading): string {
   return left === undefined ? rate : `${rate} · ~${left} turns to full`
 }
 
-export function forecastText(history: readonly number[], reading: Reading | null): string {
-  if (reading === null) return 'Token Weather: no reading yet. It appears after the first reply.'
-  const now = sky(reading.percent)
-  const lines = [
-    `${now.icon} ${now.label}: context ${reading.percent}% full (${kilo(reading.tokens)}/${kilo(reading.window)} tokens)`,
-    `Last ${history.length} turns: ${sparkline(history) || '-'}  ${outlook(history, reading)}`,
-  ]
-  if (now.advice !== undefined) lines.push(`Advice: ${now.advice}`)
+export function forecastText(history: readonly number[], reading: Reading | null, limitLines: readonly string[]): string {
+  const lines = ['Usage Forecast']
+  if (reading === null) {
+    lines.push('Context: no reading yet. It appears after the first reply.')
+  } else {
+    const now = sky(reading.percent)
+    lines.push(
+      `${now.icon} ${now.label}: context ${reading.percent}% full (${kilo(reading.tokens)}/${kilo(reading.window)} tokens)`,
+      `Last ${history.length} turns: ${sparkline(history) || '-'}  ${outlook(history, reading)}`,
+    )
+    if (now.advice !== undefined) lines.push(`Advice: ${now.advice}`)
+  }
+  lines.push(...(limitLines.length > 0 ? limitLines : ['Plan limits: no reading yet (they appear after a reply on a Claude subscription).']))
   return lines.join('\n')
 }

@@ -1,0 +1,9 @@
+{
+  "name": "usage-forecast",
+  "version": "1.0.0",
+  "description": "A band above the prompt with your plan's 5-hour and weekly limits (how much is used, when each resets, and whether you are on pace to run out) plus a forecast for the context window. /forecast",
+  "author": {
+    "name": "harshitmywork17"
+  },
+  "types": "./types/index.d.ts"
+}

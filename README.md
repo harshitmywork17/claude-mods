@@ -4,7 +4,7 @@ A Claude Code plugin marketplace, and the single home for Claude customizations 
 
 | Plugin | Command | What it does |
 |---|---|---|
-| token-weather | `/weather`, `/weather hide`, `/weather show` | A band above the prompt: context fill as weather, a sparkline of the last 12 turns, growth per turn, turns left, and a `/compact` hint near the limit. |
+| usage-forecast | `/forecast`, `/forecast hide`, `/forecast show` | A band above the prompt. **5-hour** and **Weekly** plan limits as coloured bars (green, then yellow from 70%, red from 90%) with the percent used, a reset countdown and the reset time (`↻ resets in 1h 12m · 15:40`), and `⚠ at this pace, out in 40m` when you would run out before the reset. Below it, the context window as weather with a 12-turn sparkline and turns left. Replaces token-weather. |
 | blast-radius | `/blast-radius`, `/blast-radius <command>` (dry run) | Catches `rm -rf`, `git reset --hard`, force pushes, `git clean -f`, `git checkout .`, `git branch -D`, `git stash drop/clear`, `DROP`/`TRUNCATE`, `mkfs`, `dd of=/dev/...`. It shows what the command would touch in a pane and forces a permission prompt. A deny from your settings is never loosened. |
 | replay-theater | `/replay`, `/replay 2` | Records each turn's Edit and Write calls. In the pane, `n`/`p` step through the diffs, `o`/`w` change turn, and Esc closes it. |
 | changed-files | `/changed-files` | A live sidebar of every file touched this session, with +/- counts, edit counts and a `new` tag. It opens by itself on the first edit. |
@@ -34,7 +34,7 @@ Mods run in Claude Code only: the terminal, the desktop app's Code tab, IDE exte
 
 ```bash
 claude plugin marketplace add harshitmywork17/claude-mods
-claude plugin install token-weather@harshit-mods   # repeat for each plugin
+claude plugin install usage-forecast@harshit-mods   # repeat for each plugin
 ```
 
 ## Develop

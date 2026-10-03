@@ -6,9 +6,9 @@
   },
   "plugins": [
     {
-      "name": "token-weather",
-      "source": "./plugins/token-weather",
-      "description": "Context window forecast above the prompt: fill, 12-turn sparkline, turns left. /weather"
+      "name": "usage-forecast",
+      "source": "./plugins/usage-forecast",
+      "description": "Plan limits above the prompt: 5-hour and weekly usage bars, reset countdowns and times, a pace warning, plus the context forecast. /forecast"
     },
     {
       "name": "blast-radius",

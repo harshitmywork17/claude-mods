@@ -1,9 +1,0 @@
-{
-  "name": "token-weather",
-  "version": "0.1.0",
-  "description": "A weather forecast for your context window: how full it is, a sparkline of the last 12 turns, and turns left at the current rate.",
-  "author": {
-    "name": "harshitmywork17"
-  },
-  "types": "./types/index.d.ts"
-}
