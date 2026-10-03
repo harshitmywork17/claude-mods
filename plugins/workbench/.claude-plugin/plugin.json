@@ -1,0 +1,7 @@
+{
+  "name": "workbench",
+  "version": "1.0.0",
+  "description": "One workspace for watching and understanding Claude's work: a HUD above the prompt and a pane with Now, Changes (side-by-side diffs by turn), live Preview, Artifacts, Code Map and Usage. /wb",
+  "author": { "name": "harshitmywork17" },
+  "types": "./types/index.d.ts"
+}

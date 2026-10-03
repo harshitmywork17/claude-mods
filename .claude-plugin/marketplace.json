@@ -72,6 +72,11 @@
       "name": "codebase-atlas",
       "source": "./plugins/codebase-atlas",
       "description": "Understand a codebase visually: live architecture map, changes by function with impact, component outlines, call graph, decision timeline and side-question explanations. /atlas"
+    },
+    {
+      "name": "workbench",
+      "source": "./plugins/workbench",
+      "description": "One workspace: a HUD above the prompt and a pane with Now, Changes (side-by-side diffs by turn), live Preview, Artifacts, Code Map and Usage. /wb"
     }
   ]
 }
