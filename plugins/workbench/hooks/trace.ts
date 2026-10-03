@@ -128,3 +128,14 @@ export function colorOf(step: Step, now: number): string {
 }
 
 export const BADGE: Record<StepStatus, string> = { running: '●', ok: '✓', error: '✗', denied: '⊘' }
+
+/** What a turn's prompt reads as: a background task's notice becomes its one-line summary instead of raw tags. */
+export function promptLabel(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  if (flat === '') return '(continued without a prompt)'
+  if (flat.startsWith('<task-notification>')) {
+    const summary = /<summary>(.*?)<\/summary>/.exec(flat)?.[1]?.trim()
+    return `↻ ${summary === undefined || summary === '' ? 'a background task finished' : summary}`
+  }
+  return flat.slice(0, 160)
+}

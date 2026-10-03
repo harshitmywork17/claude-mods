@@ -76,7 +76,7 @@
     {
       "name": "workbench",
       "source": "./plugins/workbench",
-      "description": "One workspace: a HUD above the prompt and a pane with Now, Changes (side-by-side diffs by turn), live Preview, Artifacts, Code Map and Usage. /wb"
+      "description": "One workspace: a one-line band above the prompt and a pane with Now, Changes (diffstat, changed functions, highlighted diffs, replay), live Preview, Artifacts, Code Map and Usage. /wb"
     }
   ]
 }

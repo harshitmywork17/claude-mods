@@ -64,6 +64,9 @@ export type FileSummary = {
   symbols: SymbolChange[]
   added: number
   removed: number
+  /** The change as unified-diff text with context, cut at a hunk boundary to fit a Code element. */
+  diff: string
+  isDiffCut: boolean
   error?: string
 }
 
@@ -89,7 +92,7 @@ export type Artifact = { path: string; kind: ArtifactKind; size: number; mtimeMs
 
 // ── Code Map (from Codebase Atlas) ──────────────────────────────────────
 
-export type Group = { id: string; files: number; lines: number; symbols: number; level: number }
+export type Group = { id: string; files: number; lines: number; symbols: number; level: number; /** Its files, at most 60. */ paths: string[] }
 export type Edge = { from: string; to: string; count: number }
 export type Graph = { root: string; isGit: boolean; files: number; groups: Group[]; edges: Edge[]; isTruncated: boolean }
 export type ScanStatus = 'idle' | 'scanning' | 'ready' | 'no-folder' | 'error'
@@ -122,6 +125,9 @@ export type MapView = 'map' | 'components' | 'calls'
 
 export type Reading = { percent: number; tokens: number; window: number }
 export type Limit = { kind: string; percentUsed: number; resetsAt?: string }
+
+/** File path to its text before Claude's first edit this session; null for a file Claude created. */
+export type Baselines = Record<string, string | null>
 
 export type Tab = 'now' | 'changes' | 'preview' | 'artifacts' | 'map' | 'usage'
 
@@ -157,6 +163,7 @@ declare module 'claude-code' {
       reading: Reading | null
       history: number[]
       costUsd: number | null
+      baselines: Baselines
     }
   }
 }

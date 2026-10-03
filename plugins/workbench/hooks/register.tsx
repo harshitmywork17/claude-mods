@@ -1,8 +1,9 @@
 import { atom, read, update } from 'claude-code'
-import type { Elements, EngineInterface, RenderNode, Register, SessionContextUsage, SessionRateLimit } from 'claude-code'
+import type { Elements, EngineInterface, RenderNode, Register, SessionContextUsage, SessionRateLimit, UiPressArgument } from 'claude-code'
 
 import type {
   Artifact,
+  Baselines,
   CallView,
   EditHunk,
   EditRecord,
@@ -18,10 +19,11 @@ import type {
   Turn,
 } from '../types'
 import { bodyOf, calleesIn, enclosingSymbol, isDefinitionLine, symbolFromSelection } from './calls'
-import { escapeRegex, lineDiff, markChanged, outlineOf, symbolChanges } from './changes'
+import { escapeRegex, innermostChanged, lineDiff, markChanged, outlineOf, symbolChanges } from './changes'
+import { changedRanges, fit, hunksText, unifiedDiff } from './diff'
 import type { Range } from './changes'
 import { HISTORY_LENGTH, kilo, outlook, sky, sparkline } from './forecast'
-import { KIND_ICON, KIND_LABEL, ago, artifactKind, bytes, htmlOutline, jsonTree, parseCsv, parseJson, previewKind } from './files'
+import { KIND_LABEL, ago, artifactKind, bytes, htmlOutline, jsonTree, parseCsv, parseJson, previewKind } from './files'
 import { duration, meter, sortLimits, viewOf } from './limits'
 import {
   IMPORT_PATTERN,
@@ -40,9 +42,8 @@ import {
   shortCount,
 } from './scan'
 import type { Scan } from './scan'
-import { fit, sideBySide } from './sidebyside'
-import { C, hasContent, hue, pill } from './theme'
-import { BADGE, MAX_TURNS, bar, colorOf, modelTime, onNewest, preview, relabel, seconds, statusOf, summarize, withStep, withStepChange } from './trace'
+import { C, diffstat, hasContent, head, hue, pill, tail } from './theme'
+import { BADGE, MAX_TURNS, modelTime, onNewest, preview, promptLabel, relabel, seconds, statusOf, summarize, withStep, withStepChange } from './trace'
 
 // ── State ───────────────────────────────────────────────────────────────
 
@@ -72,12 +73,17 @@ const limitsAtom = atom({ plugin: 'workbench', key: 'limits' } as const, [])
 const readingAtom = atom({ plugin: 'workbench', key: 'reading' } as const, null)
 const historyAtom = atom({ plugin: 'workbench', key: 'history' } as const, [])
 const costAtom = atom({ plugin: 'workbench', key: 'costUsd' } as const, null)
+/** Each file as it was before Claude first touched it this session, in state so a reload keeps it. */
+const baselinesAtom = atom({ plugin: 'workbench', key: 'baselines' } as const, {})
 
 const PANE = 'workbench'
 const TITLE = 'Workbench'
+/** The sidebar width asked for: room for the tabs, a diff and the change bars on one line. */
+const PANE_COLUMNS = 76
 const MAX_EDITS = 300
+/** Larger files keep no baseline: their whole-file diff falls back to the recorded edits. */
+const MAX_BASELINE_CHARS = 400_000
 const MAX_HUNK_LINES = 400
-const MAX_DIFF_ROWS = 220
 const MAX_PREVIEW_CHARS = 200_000
 const MAX_CODE_CHARS = 9000
 const MAX_MARKDOWN_CHARS = 30_000
@@ -110,8 +116,6 @@ let cache: Scan | null = null
 let isScanning = false
 /** Folder mode: each source file's text and modification time as last read. */
 const current = new Map<string, { text: string; mtimeMs: number }>()
-/** Each file as it was before Claude first touched it this session; null for a file Claude created. */
-const editBaselines = new Map<string, string | null>()
 /** Every file in the folder when the session began: what Artifacts compares against. */
 let startListing: Set<string> | null = null
 const claudeCreated = new Set<string>()
@@ -120,6 +124,7 @@ let browser: string | null | undefined
 let isBusy = false
 let turnCostStart: number | null = null
 let previewGeneration = 0
+let hasHinted = false
 
 // ── Files and folders ───────────────────────────────────────────────────
 
@@ -260,9 +265,10 @@ async function searchSources($: EngineInterface, src: Source, gitPattern: string
 }
 
 /** Lines changed this session in a file, from the text it had before Claude first touched it. */
-function sessionRanges(path: string, text: string): Range[] {
-  if (!editBaselines.has(path)) return []
-  return lineDiff(path, editBaselines.get(path) ?? null, text).ranges
+async function sessionRanges($: EngineInterface, path: string, text: string): Promise<Range[]> {
+  const baselines = await read($, baselinesAtom)
+  if (!(path in baselines)) return []
+  return lineDiff(path, baselines[path] ?? null, text).ranges
 }
 
 async function loadOutline($: EngineInterface, path: string): Promise<void> {
@@ -274,7 +280,7 @@ async function loadOutline($: EngineInterface, path: string): Promise<void> {
     const scanned = await ensureScan($)
     const text = await readText($, absolute(path, root))
     if (text === '') throw new Error(`Could not read ${path}.`)
-    const entries = markChanged(outlineOf(text, path), sessionRanges(path, text)).map(entry => ({
+    const entries = markChanged(outlineOf(text, path), await sessionRanges($, path, text)).map(entry => ({
       ...entry,
       calls:
         entry.kind === 'class'
@@ -372,16 +378,16 @@ async function recordEdit($: EngineInterface, tool: string, input: Record<string
   if (abs === null) return null
   const file = relative(abs, root)
   const isCreate = result.type === 'create'
-  if (!editBaselines.has(file)) editBaselines.set(file, isCreate ? null : (result.originalFile ?? null))
+  const baseline = isCreate ? null : (result.originalFile ?? null)
+  if (!(file in (await read($, baselinesAtom))) && (baseline === null || baseline.length <= MAX_BASELINE_CHARS)) {
+    await update($, baselinesAtom, (all): Baselines => ({ ...all, [file]: baseline }))
+  }
   if (isCreate) claudeCreated.add(file)
 
   const { hunks, isCut } = hunksOf(result)
   const lines = hunks.flatMap(hunk => hunk.lines)
   const text = await readText($, abs)
-  const ranges: Range[] = hunks.map(hunk => [Math.max(1, hunk.newStart), Math.max(1, hunk.newStart + Math.max(hunk.newLines, 1) - 1)])
-  const symbols = markChanged(outlineOf(text, file), ranges)
-    .filter(entry => entry.isChanged)
-    .map(entry => entry.name)
+  const symbols = innermostChanged(markChanged(outlineOf(text, file), changedRanges(hunks))).map(entry => entry.name)
   const record: EditRecord = {
     id: `${tool}-${await $.clock.now()}-${Math.random().toString(36).slice(2, 7)}`,
     turnId,
@@ -399,16 +405,34 @@ async function recordEdit($: EngineInterface, tool: string, input: Record<string
 }
 
 async function loadFileSummary($: EngineInterface, file: string): Promise<void> {
-  await update($, fileSummaryAtom, (): FileSummary => ({ file, status: 'loading', symbols: [], added: 0, removed: 0 }))
+  await update($, fileSummaryAtom, (): FileSummary => ({ file, status: 'loading', symbols: [], added: 0, removed: 0, diff: '', isDiffCut: false }))
   try {
     const root = await rootOf($)
     const after = await readText($, absolute(file, root))
-    const before = editBaselines.has(file) ? (editBaselines.get(file) ?? null) : after
+    const baselines = await read($, baselinesAtom)
+    if (!(file in baselines)) {
+      // No baseline kept (a very large file): show the recorded edits one after another instead.
+      const mine = (await read($, editsAtom)).filter(edit => edit.file === file)
+      const joined = hunksText(mine.flatMap(edit => edit.hunks))
+      const summary: FileSummary = {
+        file,
+        status: 'ready',
+        symbols: [],
+        added: mine.reduce((sum, edit) => sum + edit.added, 0),
+        removed: mine.reduce((sum, edit) => sum + edit.removed, 0),
+        diff: joined.text,
+        isDiffCut: joined.isCut,
+      }
+      await update($, fileSummaryAtom, () => summary)
+      return
+    }
+    const before = baselines[file] ?? null
     const diff = lineDiff(file, before, after === '' && before !== null ? null : after)
     const symbols = symbolChanges(outlineOf(after, file), outlineOf(before ?? '', file), diff.ranges)
-    await update($, fileSummaryAtom, (): FileSummary => ({ file, status: 'ready', symbols, added: diff.added, removed: diff.removed }))
+    const unified = unifiedDiff(before, after === '' && before !== null ? null : after)
+    await update($, fileSummaryAtom, (): FileSummary => ({ file, status: 'ready', symbols, added: diff.added, removed: diff.removed, diff: unified.text, isDiffCut: unified.isCut }))
   } catch (error) {
-    await update($, fileSummaryAtom, (): FileSummary => ({ file, status: 'error', symbols: [], added: 0, removed: 0, error: String(error) }))
+    await update($, fileSummaryAtom, (): FileSummary => ({ file, status: 'error', symbols: [], added: 0, removed: 0, diff: '', isDiffCut: false, error: String(error) }))
   }
 }
 
@@ -500,13 +524,15 @@ async function refreshArtifacts($: EngineInterface): Promise<void> {
   const root = await rootOf($)
   if (root === '') return
   const listed = await walk($, root, () => true, MAX_WALK_FILES)
+  // Files Claude wrote come from the edit record as well, which outlives a reload of this module.
+  const created = new Set([...claudeCreated, ...(await read($, editsAtom)).filter(edit => edit.kind === 'create').map(edit => edit.file)])
   if (startListing === null) {
-    startListing = new Set(listed.map(file => file.path).filter(path => !claudeCreated.has(path)))
+    startListing = new Set(listed.map(file => file.path).filter(path => !created.has(path)))
   }
   const before = startListing
   const made: Artifact[] = listed
-    .filter(file => !before.has(file.path) || claudeCreated.has(file.path))
-    .map(file => ({ path: file.path, kind: artifactKind(file.path), size: file.size, mtimeMs: file.mtimeMs, isByClaude: claudeCreated.has(file.path) }))
+    .filter(file => !before.has(file.path) || created.has(file.path))
+    .map(file => ({ path: file.path, kind: artifactKind(file.path), size: file.size, mtimeMs: file.mtimeMs, isByClaude: created.has(file.path) }))
     .sort((a, b) => b.mtimeMs - a.mtimeMs)
     .slice(0, MAX_ARTIFACTS)
   await update($, artifactsAtom, () => made)
@@ -527,317 +553,499 @@ function toLimits(windows: readonly SessionRateLimit[]): Limit[] {
 
 type T = Pick<Elements['terminal'], 'Box' | 'Text' | 'Button' | 'Markdown' | 'Code'>
 
-const TABS: { tab: Tab; label: string; key: string; icon: string }[] = [
-  { tab: 'now', label: 'Now', key: '1', icon: '●' },
-  { tab: 'changes', label: 'Changes', key: '2', icon: '±' },
-  { tab: 'preview', label: 'Preview', key: '3', icon: '◉' },
-  { tab: 'artifacts', label: 'Artifacts', key: '4', icon: '✦' },
-  { tab: 'map', label: 'Code Map', key: '5', icon: '◇' },
-  { tab: 'usage', label: 'Usage', key: '6', icon: '◔' },
+type Action = { key: string; hotkey: string; label: string; onPress: (press: UiPressArgument) => unknown }
+
+const TABS: { tab: Tab; label: string; key: string }[] = [
+  { tab: 'now', label: 'Now', key: '1' },
+  { tab: 'changes', label: 'Changes', key: '2' },
+  { tab: 'preview', label: 'Preview', key: '3' },
+  { tab: 'artifacts', label: 'Artifacts', key: '4' },
+  { tab: 'map', label: 'Map', key: '5' },
+  { tab: 'usage', label: 'Usage', key: '6' },
 ]
 
 const CHANGE_MARK = { added: ['+', C.ok], modified: ['~', C.warn], removed: ['−', C.bad] } as const
 const KIND_ICON_CODE = { class: '◆', function: 'ƒ', method: '·' } as const
+const TURN_STATUS = { running: ['● running', C.live], done: ['✓ done', C.ok], interrupted: ['⊘ stopped', C.warn], failed: ['✗ failed', C.bad] } as const
 
-function heading(t: T, title: string, detail?: string): RenderNode {
+function clamp(value: number, low: number, high: number): number {
+  return Math.max(low, Math.min(high, value))
+}
+
+function turnNumber(turns: readonly Turn[], turnId: string): string {
+  const index = turns.findIndex(turn => turn.id === turnId)
+  return index < 0 ? 'T–' : `T${index + 1}`
+}
+
+/** A section title, a rule to the right edge, and an optional note at the end: TITLE ──────── note */
+function section(t: T, title: string, width: number, note = '', noteColor: string = C.soft): RenderNode {
   const { Box, Text } = t
+  const label = head(title, Math.max(4, width - 8))
+  const room = width - label.length - 1 - (note === '' ? 0 : note.length + 1)
   return (
-    <Box flexDirection="row" gap={1}>
+    <Box flexDirection="row" marginTop={1}>
       <Text bold color={C.accent}>
-        ▌{title}
+        {label}
       </Text>
-      {detail !== undefined && <Text dimColor>{detail}</Text>}
+      <Text color={C.line}> {'─'.repeat(Math.max(2, room))}</Text>
+      {note !== '' && <Text color={noteColor}> {note}</Text>}
     </Box>
   )
 }
 
-function empty(t: T, text: string): RenderNode {
+/** The key legend at the bottom of a view: each action a plain button drawn as `k: label`. */
+function footer(t: T, actions: readonly Action[], width: number): RenderNode | null {
+  const { Box, Button, Text } = t
+  if (actions.length === 0) return null
+  return (
+    <Box flexDirection="column" marginTop={1}>
+      <Text color={C.line}>{'─'.repeat(width)}</Text>
+      <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+        {actions.map(action => (
+          <Button key={action.key} label={action.label} hotkey={action.hotkey} plain dimColor onPress={action.onPress} />
+        ))}
+      </Box>
+    </Box>
+  )
+}
+
+function empty(t: T, icon: string, title: string, hint: string): RenderNode {
   const { Box, Text } = t
   return (
-    <Box marginTop={1}>
-      <Text dimColor>{text}</Text>
+    <Box flexDirection="column" marginTop={1} paddingX={1}>
+      <Text bold color={C.soft}>
+        {icon} {title}
+      </Text>
+      <Text dimColor>{hint}</Text>
     </Box>
   )
 }
 
-function nowView($: EngineInterface, t: T, turns: readonly Turn[], back: number, showOutputs: boolean, now: number, columns: number): RenderNode {
-  const { Box, Button, Text } = t
+/** Fixed-width cell: content truncated, never wrapped, so columns line up. */
+function cell(t: T, width: number, child: RenderNode, isRight = false): RenderNode {
+  const { Box } = t
+  return (
+    <Box width={width} flexShrink={0} justifyContent={isRight ? 'flex-end' : 'flex-start'}>
+      {child}
+    </Box>
+  )
+}
+
+function plusMinus(t: T, added: number, removed: number): RenderNode {
+  const { Text } = t
+  return (
+    <Text>
+      <Text color={C.ok}>+{added}</Text> <Text color={C.bad}>−{removed}</Text>
+    </Text>
+  )
+}
+
+// ── Now ─────────────────────────────────────────────────────────────────
+
+function stepColor(step: Step, now: number): string {
+  if (step.status === 'running') return C.live
+  if (step.status === 'error') return C.bad
+  if (step.status === 'denied') return C.pink
+  const took = (step.endedAt ?? now) - step.startedAt
+  return took >= 30_000 ? C.bad : took >= 10_000 ? C.warn : C.soft
+}
+
+function stepRows(t: T, step: Step, now: number, width: number, indent: number, showOutputs: boolean): RenderNode {
+  const { Box, Text } = t
+  const color = stepColor(step, now)
+  const badge = step.status === 'ok' ? C.ok : color
+  const lead = indent + 2
+  const summaryWidth = Math.max(6, width - lead - 8 - 8)
+  const isProblem = step.status === 'error' || step.status === 'denied'
+  const output = step.output.replace(/\s*\n\s*/g, ' ⏎ ')
+  return (
+    <Box key={`step-${step.id}`} flexDirection="column">
+      <Box flexDirection="row">
+        {cell(t, lead, <Text color={badge}>{`${' '.repeat(indent)}${BADGE[step.status]}`}</Text>)}
+        {cell(
+          t,
+          8,
+          <Text bold color={C.text} wrap="truncate-end">
+            {step.tool}
+          </Text>,
+        )}
+        {cell(
+          t,
+          summaryWidth,
+          <Text color={C.soft} wrap="truncate-end">
+            {step.summary === '' ? '—' : step.summary}
+          </Text>,
+        )}
+        {cell(t, 8, <Text color={color}>{seconds((step.endedAt ?? now) - step.startedAt)}</Text>, true)}
+      </Box>
+      {(showOutputs || isProblem) && output !== '' && (
+        <Box paddingLeft={lead}>
+          <Text color={isProblem ? C.bad : C.line} wrap="truncate-end">
+            ↳ {output}
+          </Text>
+        </Box>
+      )}
+    </Box>
+  )
+}
+
+function nowView($: EngineInterface, t: T, turns: readonly Turn[], back: number, showOutputs: boolean, now: number, width: number): RenderNode {
+  const { Box, Text } = t
   const offset = Math.min(back, Math.max(0, turns.length - 1))
   const turn = turns[turns.length - 1 - offset]
-  if (turn === undefined) return empty(t, 'Waiting for the next turn. Each tool call, its output, subagents and timings show here live.')
+  if (turn === undefined) {
+    return empty(t, '●', 'Waiting for the first turn', 'Every tool call shows here as it runs: what ran, how long it took, its output, and the subagents it started.')
+  }
 
   const total = (turn.endedAt ?? now) - turn.startedAt
-  const barWidth = Math.max(10, Math.floor(columns * 0.3))
-  const summaryWidth = Math.max(8, columns - barWidth - 26)
   const failed = turn.steps.filter(step => step.status === 'error' || step.status === 'denied').length
-  const status = { running: ['● running', C.live], done: ['✓ done', C.ok], interrupted: ['⊘ interrupted', C.warn], failed: ['✗ failed', C.bad] } as const
+  const counts = new Map<string, number>()
+  for (const step of turn.steps) counts.set(step.tool, (counts.get(step.tool) ?? 0) + 1)
+  const [statusText, statusColor] = TURN_STATUS[turn.status]
+
+  // Subagent lanes sit under the Agent call that started them; lanes still unclaimed follow the main steps.
+  const claimed = new Set(turn.steps.map(step => step.agent?.agentId).filter((id): id is string => id !== undefined))
+  const loose = turn.lanes.filter(lane => lane.id !== 'main' && !claimed.has(lane.id) && turn.steps.some(step => step.lane === lane.id))
+  const laneSteps = (id: string): Step[] => turn.steps.filter(step => step.lane === id)
 
   return (
     <Box flexDirection="column">
-      <Box flexDirection="row" gap={1}>
-        <Text bold color={status[turn.status][1]}>
-          {status[turn.status][0]}
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text>
+          <Text bold color={C.text}>
+            Turn {turns.length - offset}
+          </Text>
+          <Text color={C.soft}> of {turns.length}</Text>
         </Text>
-        <Text dimColor>
-          turn {turns.length - offset}/{turns.length} · {seconds(total)} · {turn.steps.length} tools{failed > 0 ? ` · ${failed} failed` : ''} · model{' '}
-          {seconds(modelTime(turn, now))}
+        <Text>
+          <Text bold color={statusColor}>
+            {statusText}
+          </Text>
+          <Text color={C.soft}> · {seconds(total)}</Text>
         </Text>
       </Box>
-      <Text wrap="truncate-end">“{turn.prompt}”</Text>
-      {turn.lanes.map(lane => {
-        const steps = turn.steps.filter(step => step.lane === lane.id)
-        if (steps.length === 0 && lane.id !== 'main') return null
-        return (
-          <Box key={`lane-${lane.id}`} flexDirection="column" marginTop={1} borderStyle="round" borderColor={lane.id === 'main' ? C.line : C.accent} paddingX={1}>
-            <Text bold color={lane.id === 'main' ? C.live : C.accent} wrap="truncate-end">
-              {lane.id === 'main' ? '▌Main' : `▌⑂ ${lane.label}`}
-            </Text>
-            {steps.length === 0 && <Text dimColor> no tool calls yet</Text>}
-            {steps.map(step => {
-              const color = hue(colorOf(step, now))
-              const { pad, fill } = bar(step, turn, now, barWidth)
-              return (
-                <Box key={`step-${step.id}`} flexDirection="column">
-                  <Box flexDirection="row">
-                    <Box width={3} flexShrink={0}>
-                      <Text color={color}> {BADGE[step.status]}</Text>
-                    </Box>
-                    <Box width={11} flexShrink={0}>
-                      <Text bold wrap="truncate-end">
-                        {step.tool}
-                      </Text>
-                    </Box>
-                    <Box width={summaryWidth} flexShrink={1}>
-                      <Text dimColor wrap="truncate-end">
-                        {step.summary}
-                      </Text>
-                    </Box>
-                    <Box width={barWidth} flexShrink={0}>
-                      <Text>{pad}</Text>
-                      <Text color={color}>{fill}</Text>
-                    </Box>
-                    <Box width={8} flexShrink={0} justifyContent="flex-end">
-                      <Text color={color}>{seconds((step.endedAt ?? now) - step.startedAt)}</Text>
-                    </Box>
-                  </Box>
-                  {step.agent !== undefined && (
-                    <Text color={C.accent}>
-                      {'    '}⑂ {step.agent.type}
-                      {step.agent.toolCount === undefined ? '' : ` · ${step.agent.toolCount} tools`}
-                      {step.agent.tokens === undefined ? '' : ` · ${kilo(step.agent.tokens)} tokens`}
-                    </Text>
-                  )}
-                  {showOutputs && step.output !== '' && (
-                    <Text dimColor wrap="truncate-end">
-                      {'    ↳ '}
-                      {step.output.replace(/\n/g, ' ⏎ ')}
-                    </Text>
-                  )}
-                </Box>
-              )
-            })}
-          </Box>
-        )
-      })}
-      <Box flexDirection="row" gap={1} marginTop={1}>
-        <Button key="now-outputs" label={showOutputs ? 'hide outputs' : 'show outputs'} hotkey="v" onPress={() => update($, showOutputsAtom, value => !value)} />
-        {offset < turns.length - 1 && <Button key="now-older" label="older turn" hotkey="o" onPress={() => update($, turnBackAtom, n => n + 1)} />}
-        {offset > 0 && <Button key="now-newer" label="newer turn" hotkey="w" onPress={() => update($, turnBackAtom, n => n - 1)} />}
+      <Text italic color={C.soft} wrap="truncate-end">
+        “{turn.prompt}”
+      </Text>
+      <Box flexDirection="row" flexWrap="wrap" columnGap={1} marginTop={1}>
+        {[...counts].map(([tool, count]) => (
+          <Text key={`count-${tool}`} backgroundColor={C.chip} color={C.text}>
+            {` ${tool} ${count} `}
+          </Text>
+        ))}
+        <Text color={C.soft}>model {seconds(modelTime(turn, now))}</Text>
       </Box>
+      {section(t, 'STEPS', width, `${turn.steps.length} call${turn.steps.length === 1 ? '' : 's'}${failed > 0 ? ` · ${failed} failed` : ''}`, failed > 0 ? C.bad : C.soft)}
+      {turn.steps.length === 0 && <Text dimColor> Thinking: no tool calls yet.</Text>}
+      {laneSteps('main').map(step => (
+        <Box key={`main-${step.id}`} flexDirection="column">
+          {stepRows(t, step, now, width, 0, showOutputs)}
+          {step.agent !== undefined && (
+            <Box flexDirection="column">
+              <Text color={C.accent} wrap="truncate-end">
+                {'  '}⑂ {step.agent.type}
+                {step.agent.toolCount === undefined ? '' : ` · ${step.agent.toolCount} tools`}
+                {step.agent.tokens === undefined ? '' : ` · ${kilo(step.agent.tokens)} tokens`}
+              </Text>
+              {step.agent.agentId !== undefined && laneSteps(step.agent.agentId).map(inner => stepRows(t, inner, now, width, 2, showOutputs))}
+            </Box>
+          )}
+        </Box>
+      ))}
+      {loose.map(lane => (
+        <Box key={`lane-${lane.id}`} flexDirection="column">
+          <Text color={C.accent} wrap="truncate-end">
+            {'  '}⑂ {lane.label}
+          </Text>
+          {laneSteps(lane.id).map(inner => stepRows(t, inner, now, width, 2, showOutputs))}
+        </Box>
+      ))}
+      {footer(
+        t,
+        [
+          { key: 'now-outputs', hotkey: 'v', label: showOutputs ? 'hide outputs' : 'show outputs', onPress: () => update($, showOutputsAtom, value => !value) },
+          ...(offset < turns.length - 1 ? [{ key: 'now-older', hotkey: 'o', label: 'older turn', onPress: () => update($, turnBackAtom, n => n + 1) }] : []),
+          ...(offset > 0 ? [{ key: 'now-newer', hotkey: 'w', label: 'newer turn', onPress: () => update($, turnBackAtom, n => n - 1) }] : []),
+        ],
+        width,
+      )}
     </Box>
   )
 }
 
-function diffView($: EngineInterface, t: T, edits: readonly EditRecord[], edit: EditRecord, turns: readonly Turn[], columns: number): RenderNode {
+// ── Changes ─────────────────────────────────────────────────────────────
+
+type FileStat = { file: string; added: number; removed: number; isNew: boolean; symbols: string[]; edits: EditRecord[] }
+
+function fileStats(edits: readonly EditRecord[]): FileStat[] {
+  const byFile = new Map<string, FileStat>()
+  for (const edit of edits) {
+    const stat = byFile.get(edit.file) ?? { file: edit.file, added: 0, removed: 0, isNew: false, symbols: [], edits: [] }
+    stat.added += edit.added
+    stat.removed += edit.removed
+    stat.isNew = stat.isNew || edit.kind === 'create'
+    stat.symbols = [...new Set([...stat.symbols, ...edit.symbols])]
+    stat.edits.push(edit)
+    byFile.set(edit.file, stat)
+  }
+  return [...byFile.values()].sort((a, b) => a.file.localeCompare(b.file))
+}
+
+function changesOverview($: EngineInterface, t: T, edits: readonly EditRecord[], turns: readonly Turn[], width: number): RenderNode {
   const { Box, Button, Text } = t
+  if (edits.length === 0) {
+    return empty(t, '±', 'No changes yet', 'Each file Claude edits appears here with the functions it touched and a highlighted diff. Replay walks through every edit in order.')
+  }
+  const files = fileStats(edits)
+  const added = files.reduce((sum, file) => sum + file.added, 0)
+  const removed = files.reduce((sum, file) => sum + file.removed, 0)
+  const most = Math.max(1, ...files.map(file => file.added + file.removed))
+  const turnIds = [...new Set(edits.map(edit => edit.turnId))].reverse()
+  const barWidth = width >= 70 ? 12 : 8
+  const pathWidth = Math.max(10, width - 3 - 7 - 7 - barWidth - 1)
+
+  return (
+    <Box flexDirection="column">
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text>
+          <Text bold color={C.text}>
+            {files.length} file{files.length === 1 ? '' : 's'} changed
+          </Text>
+          {'  '}
+          {plusMinus(t, added, removed)}
+        </Text>
+        <Text color={C.soft}>
+          {edits.length} edit{edits.length === 1 ? '' : 's'} · {turnIds.length} turn{turnIds.length === 1 ? '' : 's'}
+        </Text>
+      </Box>
+      {section(t, 'FILES', width)}
+      {files.map((stat, index) => {
+        const bars = diffstat(stat.added, stat.removed, most, barWidth)
+        return (
+          <Box key={`cf-${index}`} flexDirection="column">
+            <Box flexDirection="row">
+              {cell(
+                t,
+                3,
+                <Text bold color={stat.isNew ? C.ok : C.warn}>
+                  {stat.isNew ? ' A' : ' M'}
+                </Text>,
+              )}
+              {cell(t, pathWidth, <Button key={`cfile:${index}`} label={tail(stat.file, pathWidth - 1)} plain onPress={() => openFile($, stat.file)} />)}
+              {cell(t, 7, <Text color={C.ok}>+{stat.added}</Text>, true)}
+              {cell(t, 7, <Text color={stat.removed === 0 ? C.line : C.bad}>−{stat.removed}</Text>, true)}
+              <Text> </Text>
+              <Text>
+                <Text color={C.ok}>{bars.plus}</Text>
+                <Text color={C.bad}>{bars.minus}</Text>
+              </Text>
+            </Box>
+            {stat.symbols.length > 0 && (
+              <Text color={C.line} wrap="truncate-end">
+                {'   '}ƒ {stat.symbols.join(' · ')}
+              </Text>
+            )}
+          </Box>
+        )
+      })}
+      {section(t, 'BY TURN', width, 'newest first')}
+      {turnIds.map(turnId => {
+        const inTurn = edits.filter(edit => edit.turnId === turnId)
+        const turnFiles = new Set(inTurn.map(edit => edit.file)).size
+        const prompt = turns.find(turn => turn.id === turnId)?.prompt ?? 'an earlier turn'
+        const stats = `${turnFiles} file${turnFiles === 1 ? '' : 's'}`
+        return (
+          <Box key={`ct-${turnId}`} flexDirection="row">
+            {cell(t, 5, <Button key={`cturn:${turnId}`} label={turnNumber(turns, turnId)} plain onPress={() => update($, changeEditAtom, () => inTurn[0]?.id ?? null)} />)}
+            {cell(
+              t,
+              Math.max(8, width - 5 - 22),
+              <Text italic color={C.soft} wrap="truncate-end">
+                “{prompt}”
+              </Text>,
+            )}
+            {cell(
+              t,
+              22,
+              <Text>
+                <Text color={C.soft}>{stats} </Text>
+                {plusMinus(
+                  t,
+                  inTurn.reduce((sum, edit) => sum + edit.added, 0),
+                  inTurn.reduce((sum, edit) => sum + edit.removed, 0),
+                )}
+              </Text>,
+              true,
+            )}
+          </Box>
+        )
+      })}
+      {footer(t, [{ key: 'replay', hotkey: 'r', label: 'replay every edit', onPress: () => update($, changeEditAtom, () => edits[0]?.id ?? null) }], width)}
+    </Box>
+  )
+}
+
+function topBar(t: T, back: Action, title: string, right: RenderNode, width: number): RenderNode {
+  const { Box, Button, Text } = t
+  return (
+    <Box flexDirection="row" justifyContent="space-between">
+      <Box flexDirection="row" gap={1}>
+        <Button key={back.key} label={back.label} hotkey={back.hotkey} plain dimColor onPress={back.onPress} />
+        <Text bold color={C.text}>
+          {tail(title, Math.max(10, width - 30))}
+        </Text>
+      </Box>
+      {right}
+    </Box>
+  )
+}
+
+function diffBlock(t: T, diff: { text: string; isCut: boolean }, path: string, hint: string): RenderNode {
+  const { Box, Code, Text } = t
+  if (diff.text === '') return <Text dimColor> No line changes to show.</Text>
+  return (
+    <Box flexDirection="column">
+      <Code key={`diff-${path}`} source={diff.text} format="diff" path={path} wrap="truncate-end" />
+      {diff.isCut && <Text dimColor>… cut to fit: {hint}</Text>}
+    </Box>
+  )
+}
+
+function diffView($: EngineInterface, t: T, edits: readonly EditRecord[], edit: EditRecord, turns: readonly Turn[], width: number): RenderNode {
+  const { Box, Text } = t
   const index = edits.findIndex(one => one.id === edit.id)
   const turn = turns.find(one => one.id === edit.turnId)
-  const half = Math.max(20, Math.floor((columns - 3) / 2))
-  const textWidth = Math.max(8, half - 7)
-  const rows = sideBySide(edit.hunks)
-  const shown = rows.slice(0, MAX_DIFF_ROWS)
   const go = async (to: number): Promise<void> => {
     const target = edits[to]
     if (target !== undefined) await update($, changeEditAtom, () => target.id)
   }
-
-  const cell = (side: 'left' | 'right', value: { line: number; text: string; kind: ' ' | '-' | '+' } | undefined): RenderNode => {
-    const color = value?.kind === '-' ? C.bad : value?.kind === '+' ? C.ok : undefined
-    return (
-      <Box width={half} flexShrink={0} flexDirection="row">
-        <Box width={5} flexShrink={0} justifyContent="flex-end">
-          <Text dimColor>{value === undefined ? '' : String(value.line)}</Text>
-        </Box>
-        <Box width={2} flexShrink={0}>
-          <Text color={color}>{value === undefined || value.kind === ' ' ? ' ' : side === 'left' ? '-' : '+'}</Text>
-        </Box>
-        <Text color={color} dimColor={value?.kind === ' '}>
-          {value === undefined ? '' : fit(value.text, textWidth)}
-        </Text>
-      </Box>
-    )
-  }
-
+  const diff = hunksText(edit.hunks)
   return (
     <Box flexDirection="column">
-      <Box flexDirection="row" gap={1}>
-        <Text bold>{edit.file}</Text>
-        <Text color={C.ok}>+{edit.added}</Text>
-        <Text color={C.bad}>−{edit.removed}</Text>
-        <Text dimColor>
-          {edit.kind} · edit {index + 1} of {edits.length}
+      {topBar(
+        t,
+        { key: 'diff-back', hotkey: 'b', label: '‹ back', onPress: () => update($, changeEditAtom, () => null) },
+        edit.file,
+        <Text color={C.soft}>
+          edit {index + 1} of {edits.length}
+        </Text>,
+        width,
+      )}
+      <Box flexDirection="row" columnGap={1} flexWrap="wrap">
+        <Text backgroundColor={C.chip} color={C.text}>
+          {` ${edit.kind} `}
+        </Text>
+        {plusMinus(t, edit.added, edit.removed)}
+        <Text color={C.soft} wrap="truncate-end">
+          · {turnNumber(turns, edit.turnId)} “{head(turn?.prompt ?? '', 40)}”
         </Text>
       </Box>
-      <Text dimColor wrap="truncate-end">
-        turn “{turn?.prompt ?? '?'}”{edit.symbols.length > 0 ? ` · touches ${edit.symbols.join(', ')}` : ''}
-      </Text>
-      <Box flexDirection="row" marginTop={1}>
-        <Box width={half} flexShrink={0}>
-          <Text bold color={C.bad}>
-            {'      before'}
-          </Text>
-        </Box>
-        <Text color={C.line}>│</Text>
-        <Box width={half} flexShrink={0}>
-          <Text bold color={C.ok}>
-            {'      after'}
-          </Text>
-        </Box>
-      </Box>
-      {shown.map((row, rowIndex) =>
-        row.isGap === true ? (
-          <Text key={`gap-${rowIndex}`} dimColor>
-            {'      ⋯'}
-          </Text>
-        ) : (
-          <Box key={`row-${rowIndex}`} flexDirection="row">
-            {cell('left', row.left)}
-            <Text color={C.line}>│</Text>
-            {cell('right', row.right)}
-          </Box>
-        ),
+      {edit.symbols.length > 0 && (
+        <Text color={C.warn} wrap="truncate-end">
+          ƒ {edit.symbols.join(' · ')}
+        </Text>
       )}
-      {(rows.length > shown.length || edit.isCut) && <Text dimColor>… diff cut to fit</Text>}
-      <Box flexDirection="row" gap={1} marginTop={1}>
-        <Button key="diff-prev" label="◀ prev edit" hotkey="p" onPress={() => go(index - 1)} />
-        <Button key="diff-next" label="next edit ▶" hotkey="n" variant="primary" onPress={() => go(index + 1)} />
-        <Button key="diff-file" label="whole file" hotkey="f" onPress={() => openFile($, edit.file)} />
-        <Button key="diff-preview" label="preview" hotkey="v" onPress={() => openPreview($, edit.file)} />
-        <Button key="diff-back" label="back" hotkey="b" onPress={() => update($, changeEditAtom, () => null)} />
-      </Box>
+      <Box marginTop={1}>{diffBlock(t, { text: diff.text, isCut: diff.isCut || edit.isCut }, edit.file, 'open the whole file for the full change')}</Box>
+      {footer(
+        t,
+        [
+          ...(index > 0 ? [{ key: 'diff-prev', hotkey: 'p', label: '‹ previous', onPress: () => go(index - 1) }] : []),
+          ...(index < edits.length - 1 ? [{ key: 'diff-next', hotkey: 'n', label: 'next ›', onPress: () => go(index + 1) }] : []),
+          { key: 'diff-file', hotkey: 'f', label: 'whole file', onPress: () => openFile($, edit.file) },
+          { key: 'diff-preview', hotkey: 'v', label: 'preview', onPress: () => openPreview($, edit.file) },
+        ],
+        width,
+      )}
     </Box>
   )
 }
 
-function fileView($: EngineInterface, t: T, file: string, summary: FileSummary | null, edits: readonly EditRecord[], turns: readonly Turn[]): RenderNode {
+function fileView($: EngineInterface, t: T, file: string, summary: FileSummary | null, edits: readonly EditRecord[], turns: readonly Turn[], width: number): RenderNode {
   const { Box, Button, Text } = t
   const mine = edits.filter(edit => edit.file === file)
+  const isNew = mine.some(edit => edit.kind === 'create')
   return (
     <Box flexDirection="column">
-      <Box flexDirection="row" gap={1}>
-        <Text bold>{file}</Text>
-        {summary?.status === 'ready' && <Text color={C.ok}>+{summary.added}</Text>}
-        {summary?.status === 'ready' && <Text color={C.bad}>−{summary.removed}</Text>}
-        <Text dimColor>since Claude first touched it this session</Text>
-      </Box>
-      {summary?.status === 'loading' && <Text color={C.live}>Comparing…</Text>}
-      {summary?.status === 'error' && <Text color={C.bad}>{summary.error}</Text>}
-      <Box marginTop={1}>{heading(t, 'Functions changed')}</Box>
-      {summary?.status === 'ready' && summary.symbols.length === 0 && <Text dimColor> no function-level change (imports, constants or top-level code)</Text>}
-      {summary?.symbols.map((change, index) => (
-        <Box key={`fs-${index}`} flexDirection="row" gap={1}>
-          <Text color={CHANGE_MARK[change.change][1]}>
-            {' '}
-            {CHANGE_MARK[change.change][0]} {KIND_ICON_CODE[change.kind]}
-          </Text>
-          {change.change === 'removed' ? (
-            <Text strikethrough dimColor>
-              {change.name}
+      {topBar(
+        t,
+        { key: 'file-back', hotkey: 'b', label: '‹ back', onPress: () => update($, changeFileAtom, () => null) },
+        file,
+        summary?.status === 'ready' ? (
+          <Text>
+            <Text bold color={isNew ? C.ok : C.warn}>
+              {isNew ? 'A ' : 'M '}
             </Text>
-          ) : (
-            <Button key={`fs-sym:${index}`} label={change.name} plain onPress={() => loadCalls($, change.name)} />
+            {plusMinus(t, summary.added, summary.removed)}
+          </Text>
+        ) : (
+          <Text> </Text>
+        ),
+        width,
+      )}
+      {summary?.status === 'loading' && <Text color={C.live}>Comparing with the file as it was…</Text>}
+      {summary?.status === 'error' && <Text color={C.bad}>{summary.error}</Text>}
+
+      {section(t, 'FUNCTIONS', width, summary?.status === 'ready' ? String(summary.symbols.length) : '')}
+      {summary?.status === 'ready' && summary.symbols.length === 0 && <Text dimColor> No function changed: imports, constants or top-level code.</Text>}
+      {summary?.symbols.map((change, index) => (
+        <Box key={`fs-${index}`} flexDirection="row">
+          {cell(
+            t,
+            5,
+            <Text color={CHANGE_MARK[change.change][1]}>
+              {' '}
+              {CHANGE_MARK[change.change][0]} {KIND_ICON_CODE[change.kind]}
+            </Text>,
           )}
-          <Text dimColor>
-            {change.change} · L{change.line}
-          </Text>
+          {cell(
+            t,
+            Math.max(10, width - 5 - 18),
+            change.change === 'removed' ? (
+              <Text strikethrough dimColor>
+                {change.name}
+              </Text>
+            ) : (
+              <Button key={`fs-sym:${index}`} label={change.name} plain onPress={() => loadCalls($, change.name)} />
+            ),
+          )}
+          {cell(
+            t,
+            18,
+            <Text color={C.soft}>
+              {change.change} · L{change.line}
+            </Text>,
+            true,
+          )}
         </Box>
       ))}
-      <Box marginTop={1}>{heading(t, 'Edits', `${mine.length}, oldest first`)}</Box>
+
+      {section(t, 'EDITS', width, `${mine.length}, oldest first`)}
       {mine.map((edit, index) => (
-        <Box key={`fe-${edit.id}`} flexDirection="row" gap={1}>
-          <Button key={`fe:${index}`} label={`#${index + 1}`} plain onPress={() => update($, changeEditAtom, () => edit.id)} />
-          <Text color={C.ok}>+{edit.added}</Text>
-          <Text color={C.bad}>−{edit.removed}</Text>
-          <Text dimColor wrap="truncate-end">
-            “{turns.find(turn => turn.id === edit.turnId)?.prompt ?? ''}”{edit.symbols.length > 0 ? ` · ${edit.symbols.join(', ')}` : ''}
+        <Box key={`fe-${edit.id}`} flexDirection="row">
+          {cell(t, 5, <Button key={`fe:${index}`} label={`#${index + 1}`} plain onPress={() => update($, changeEditAtom, () => edit.id)} />)}
+          {cell(t, 4, <Text color={C.accent}>{turnNumber(turns, edit.turnId)}</Text>)}
+          {cell(t, 12, plusMinus(t, edit.added, edit.removed))}
+          <Text color={C.soft} wrap="truncate-end">
+            {edit.symbols.length > 0 ? `ƒ ${edit.symbols.join(' · ')}` : edit.kind}
           </Text>
         </Box>
       ))}
-      <Box flexDirection="row" gap={1} marginTop={1}>
-        <Button key="file-preview" label="preview" hotkey="v" onPress={() => openPreview($, file)} />
-        <Button key="file-components" label="components" hotkey="m" onPress={() => loadOutline($, file)} />
-        <Button key="file-back" label="back" hotkey="b" onPress={() => update($, changeFileAtom, () => null)} />
-      </Box>
+
+      {section(t, 'DIFF', width, 'since Claude first touched it')}
+      {summary?.status === 'ready' && <Box marginTop={1}>{diffBlock(t, { text: summary.diff, isCut: summary.isDiffCut }, file, 'step through the edits above for the rest')}</Box>}
+      {footer(
+        t,
+        [
+          { key: 'file-preview', hotkey: 'v', label: 'preview', onPress: () => openPreview($, file) },
+          { key: 'file-components', hotkey: 'm', label: 'components', onPress: () => loadOutline($, file) },
+        ],
+        width,
+      )}
     </Box>
   )
 }
 
-function changesOverview($: EngineInterface, t: T, edits: readonly EditRecord[], turns: readonly Turn[]): RenderNode {
-  const { Box, Button, Text } = t
-  if (edits.length === 0) return empty(t, 'No edits yet this session. Every file Claude changes appears here, grouped by turn, down to the functions and a side-by-side diff.')
-  const files = new Set(edits.map(edit => edit.file))
-  const added = edits.reduce((sum, edit) => sum + edit.added, 0)
-  const removed = edits.reduce((sum, edit) => sum + edit.removed, 0)
-  const turnIds = [...new Set(edits.map(edit => edit.turnId))].reverse()
-
-  return (
-    <Box flexDirection="column">
-      <Box flexDirection="row" gap={1}>
-        <Text bold>
-          {files.size} file{files.size === 1 ? '' : 's'}
-        </Text>
-        <Text color={C.ok}>+{added}</Text>
-        <Text color={C.bad}>−{removed}</Text>
-        <Text dimColor>
-          · {edits.length} edits over {turnIds.length} turn{turnIds.length === 1 ? '' : 's'}
-        </Text>
-      </Box>
-      {turnIds.map(turnId => {
-        const inTurn = edits.filter(edit => edit.turnId === turnId)
-        const byFile = [...new Set(inTurn.map(edit => edit.file))]
-        const prompt = turns.find(turn => turn.id === turnId)?.prompt ?? 'earlier'
-        return (
-          <Box key={`ct-${turnId}`} flexDirection="column" marginTop={1} borderStyle="round" borderColor={C.line} paddingX={1}>
-            {heading(t, `“${prompt.length > 70 ? `${prompt.slice(0, 70)}…` : prompt}”`, `${inTurn.length} edit${inTurn.length === 1 ? '' : 's'}`)}
-            {byFile.map((file, index) => {
-              const fileEdits = inTurn.filter(edit => edit.file === file)
-              const symbols = [...new Set(fileEdits.flatMap(edit => edit.symbols))]
-              const isNew = fileEdits.some(edit => edit.kind === 'create')
-              return (
-                <Box key={`cf-${turnId}-${index}`} flexDirection="row" gap={1}>
-                  <Text> </Text>
-                  <Button key={`cfile:${turnId}:${index}`} label={file} plain onPress={() => openFile($, file)} />
-                  {isNew && <Text color={C.live}>new</Text>}
-                  <Text color={C.ok}>+{fileEdits.reduce((sum, edit) => sum + edit.added, 0)}</Text>
-                  <Text color={C.bad}>−{fileEdits.reduce((sum, edit) => sum + edit.removed, 0)}</Text>
-                  {symbols.length > 0 && (
-                    <Text color={C.warn} wrap="truncate-end">
-                      ƒ {symbols.join(', ')}
-                    </Text>
-                  )}
-                  <Button key={`cdiff:${turnId}:${index}`} label="diff" plain onPress={() => update($, changeEditAtom, () => fileEdits[0]?.id ?? null)} />
-                </Box>
-              )
-            })}
-          </Box>
-        )
-      })}
-      <Box flexDirection="row" gap={1} marginTop={1}>
-        <Button key="replay" label="replay from the start" hotkey="r" variant="primary" onPress={() => update($, changeEditAtom, () => edits[0]?.id ?? null)} />
-      </Box>
-    </Box>
-  )
-}
+// ── Preview ─────────────────────────────────────────────────────────────
 
 function csvTable(t: T, text: string, isTab: boolean, columns: number): RenderNode {
   const { Box, Text } = t
@@ -852,7 +1060,7 @@ function csvTable(t: T, text: string, isTab: boolean, columns: number): RenderNo
         <Box key={`csv-${rowIndex}`} flexDirection="row">
           {row.slice(0, count).map((value, column) => (
             <Box key={`csv-${rowIndex}-${column}`} width={width + 1} flexShrink={0}>
-              <Text bold={rowIndex === 0} color={rowIndex === 0 ? C.live : undefined} dimColor={rowIndex > 0 && rowIndex % 2 === 0}>
+              <Text bold={rowIndex === 0} color={rowIndex === 0 ? C.live : rowIndex % 2 === 0 ? C.soft : C.text}>
                 {fit(value, width)}
               </Text>
             </Box>
@@ -896,9 +1104,9 @@ function previewBody(t: T, table: Record<string, unknown>, surface: string, prev
       <Box flexDirection="column">
         {lines.map((line, index) => (
           <Box key={`json-${index}`} flexDirection="row">
-            <Text>{'  '.repeat(line.depth)}</Text>
-            <Text color={C.live}>{line.key}</Text>
-            <Text dimColor>: </Text>
+            <Text color={C.line}>{'│ '.repeat(line.depth)}</Text>
+            <Text color={C.blue}>{line.key}</Text>
+            <Text color={C.line}>: </Text>
             <Text color={color[line.kind]} wrap="truncate-end">
               {line.value}
             </Text>
@@ -918,11 +1126,7 @@ function previewBody(t: T, table: Record<string, unknown>, surface: string, prev
   if (preview.kind === 'image') return preview.image === undefined ? <Text dimColor>{preview.note}</Text> : picture(preview.image, preview.path)
   if (preview.kind === 'svg') {
     const Svg = surface === 'desktop' || surface === 'mobile' ? (table as { Svg?: Elements['desktop']['Svg'] }).Svg : undefined
-    return Svg === undefined ? (
-      <Code source={preview.text.slice(0, MAX_CODE_CHARS)} language="xml" wrap="truncate-end" />
-    ) : (
-      <Svg source={preview.text} alt={preview.path} />
-    )
+    return Svg === undefined ? <Code source={preview.text.slice(0, MAX_CODE_CHARS)} language="xml" wrap="truncate-end" /> : <Svg source={preview.text} alt={preview.path} />
   }
   const language = preview.kind === 'yaml' ? (preview.path.endsWith('.toml') ? 'toml' : 'yaml') : undefined
   return (
@@ -933,81 +1137,224 @@ function previewBody(t: T, table: Record<string, unknown>, surface: string, prev
   )
 }
 
-function previewView($: EngineInterface, t: T, table: Record<string, unknown>, surface: string, preview: Preview | null, isFollowing: boolean, columns: number): RenderNode {
+/** Files worth a quick switch: the latest edited and created ones, newest first. */
+function recentFiles(edits: readonly EditRecord[], artifacts: readonly Artifact[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const path of [...edits.map(edit => edit.file).reverse(), ...artifacts.map(one => one.path)]) {
+    if (seen.has(path)) continue
+    seen.add(path)
+    out.push(path)
+  }
+  return out.slice(0, 6)
+}
+
+function previewView(
+  $: EngineInterface,
+  t: T,
+  table: Record<string, unknown>,
+  surface: string,
+  preview: Preview | null,
+  isFollowing: boolean,
+  recent: readonly string[],
+  width: number,
+): RenderNode {
   const { Box, Button, Text } = t
-  const kindLabel = preview === null ? '' : preview.kind.toUpperCase()
+  const others = recent.filter(path => path !== preview?.path)
+  const recentRow =
+    others.length === 0 ? null : (
+      <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+        <Text color={C.line}>recent</Text>
+        {others.map((path, index) => (
+          <Button key={`pv-recent:${index}`} label={path.split('/').pop() ?? path} plain dimColor onPress={() => openPreview($, path)} />
+        ))}
+      </Box>
+    )
+  if (preview === null) {
+    return (
+      <Box flexDirection="column">
+        {empty(t, '◉', 'Nothing to preview yet', 'Files Claude edits open here as they change. Pick one in Changes or Artifacts, or run /wb preview <file>.')}
+        {recentRow !== null && <Box marginTop={1}>{recentRow}</Box>}
+      </Box>
+    )
+  }
   return (
     <Box flexDirection="column">
-      {preview !== null && (
-        <Box flexDirection="row" gap={1}>
-          <Text bold>{preview.path}</Text>
-          <Text color={C.live}>{kindLabel}</Text>
-          <Text dimColor>{bytes(preview.size)}</Text>
-          {preview.note !== undefined && preview.kind !== 'image' && <Text color={C.warn}>{preview.note}</Text>}
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text bold color={C.text}>
+          {tail(preview.path, Math.max(10, width - 28))}
+        </Text>
+        <Box flexDirection="row" columnGap={1}>
+          <Text backgroundColor={C.chip} color={C.live}>
+            {` ${preview.kind.toUpperCase()} `}
+          </Text>
+          <Text color={C.soft}>{bytes(preview.size)}</Text>
+          <Text color={isFollowing ? C.ok : C.soft}>{isFollowing ? '● live' : '○ pinned'}</Text>
         </Box>
-      )}
-      <Box flexDirection="row" gap={1} marginBottom={1}>
-        <Button key="pv-follow" label={isFollowing ? '● following edits' : '○ pinned'} hotkey="f" onPress={() => update($, followAtom, value => !value)} />
-        {preview !== null && <Button key="pv-refresh" label="refresh" hotkey="r" onPress={() => openPreview($, preview.path)} />}
-        {preview !== null && (
-          <Button
-            key="pv-copy"
-            label="copy path"
-            hotkey="c"
-            onPress={async press => {
+      </Box>
+      {recentRow}
+      {preview.note !== undefined && preview.kind !== 'image' && <Text color={C.warn}>{preview.note}</Text>}
+      <Text color={C.line}>{'─'.repeat(width)}</Text>
+      {preview.status === 'loading' && <Text color={C.live}>Rendering {preview.path}…</Text>}
+      {preview.status === 'error' && <Text color={C.bad}>{preview.text}</Text>}
+      {preview.status === 'ready' && previewBody(t, table, surface, preview, width)}
+      {footer(
+        t,
+        [
+          { key: 'pv-follow', hotkey: 'f', label: isFollowing ? 'pin this file' : 'follow edits', onPress: () => update($, followAtom, value => !value) },
+          { key: 'pv-refresh', hotkey: 'r', label: 'refresh', onPress: () => openPreview($, preview.path) },
+          {
+            key: 'pv-copy',
+            hotkey: 'c',
+            label: 'copy path',
+            onPress: async press => {
               const copied = await $.ui.copy({ text: absolute(preview.path, await rootOf($)), surface: press.surface })
               $.ui.toast(copied.isCopied ? 'Workbench: path copied.' : 'Workbench: could not copy here.')
-            }}
-          />
-        )}
-        {preview !== null && <Button key="pv-changes" label="changes" hotkey="g" onPress={() => openFile($, preview.path)} />}
-      </Box>
-      {preview === null && empty(t, 'Nothing to preview yet. Files Claude edits open here automatically, or pick one in Changes or Artifacts.')}
-      {preview?.status === 'loading' && <Text color={C.live}>Rendering {preview.path}…</Text>}
-      {preview?.status === 'error' && <Text color={C.bad}>{preview.text}</Text>}
-      {preview?.status === 'ready' && previewBody(t, table, surface, preview, columns)}
+            },
+          },
+          { key: 'pv-changes', hotkey: 'g', label: 'changes', onPress: () => openFile($, preview.path) },
+        ],
+        width,
+      )}
     </Box>
   )
 }
 
-function artifactsView($: EngineInterface, t: T, artifacts: readonly Artifact[], now: number): RenderNode {
+// ── Artifacts ───────────────────────────────────────────────────────────
+
+function artifactsView($: EngineInterface, t: T, artifacts: readonly Artifact[], now: number, width: number): RenderNode {
   const { Box, Button, Text } = t
   const kinds = (['doc', 'image', 'data', 'web', 'code', 'other'] as const).filter(kind => artifacts.some(one => one.kind === kind))
   const total = artifacts.reduce((sum, one) => sum + one.size, 0)
+  const pathWidth = Math.max(10, width - 2 - 9 - 9 - 3)
   return (
     <Box flexDirection="column">
-      <Box flexDirection="row" gap={1}>
-        <Text bold>
-          {artifacts.length} new file{artifacts.length === 1 ? '' : 's'}
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text>
+          <Text bold color={C.text}>
+            {artifacts.length} new file{artifacts.length === 1 ? '' : 's'}
+          </Text>
+          <Text color={C.soft}> · {bytes(total)}</Text>
         </Text>
-        <Text dimColor>· {bytes(total)} · created this session by Claude ✦ or by commands it ran</Text>
-        <Button key="art-refresh" label="refresh" hotkey="r" onPress={() => refreshArtifacts($)} />
+        <Text color={C.soft}>
+          <Text color={C.accent}>✦</Text> written by Claude
+        </Text>
       </Box>
-      {artifacts.length === 0 && empty(t, 'Nothing created yet. Reports, images, data files and code Claude makes appear here.')}
-      {kinds.map(kind => (
-        <Box key={`ak-${kind}`} flexDirection="column" marginTop={1}>
-          {heading(t, `${KIND_ICON[kind]} ${KIND_LABEL[kind]}`, String(artifacts.filter(one => one.kind === kind).length))}
-          {artifacts
-            .filter(one => one.kind === kind)
-            .map(one => {
+      {artifacts.length === 0 && empty(t, '✦', 'No new files yet', 'Reports, images, data and code that Claude writes, or that its commands produce, collect here.')}
+      {kinds.map(kind => {
+        const inKind = artifacts.filter(one => one.kind === kind)
+        return (
+          <Box key={`ak-${kind}`} flexDirection="column">
+            {section(t, KIND_LABEL[kind].toUpperCase(), width, String(inKind.length))}
+            {inKind.map(one => {
               const index = artifacts.indexOf(one)
               return (
-                <Box key={`art-${index}`} flexDirection="row" gap={1}>
-                  <Text color={one.isByClaude ? C.accent : C.line}>{one.isByClaude ? ' ✦' : '  '}</Text>
-                  <Button key={`art:${index}`} label={one.path} plain onPress={() => openPreview($, one.path)} />
-                  <Text dimColor>
-                    {bytes(one.size)} · {ago(now - one.mtimeMs)}
-                  </Text>
-                  <Button
-                    key={`art-copy:${index}`}
-                    label="copy path"
-                    plain
-                    dimColor
-                    onPress={async press => {
-                      const copied = await $.ui.copy({ text: absolute(one.path, await rootOf($)), surface: press.surface })
-                      $.ui.toast(copied.isCopied ? `Copied ${one.path}` : 'Workbench: could not copy here.')
-                    }}
-                  />
+                <Box key={`art-${index}`} flexDirection="row">
+                  {cell(t, 2, <Text color={C.accent}>{one.isByClaude ? '✦' : ' '}</Text>)}
+                  {cell(t, pathWidth, <Button key={`art:${index}`} label={tail(one.path, pathWidth - 1)} plain onPress={() => openPreview($, one.path)} />)}
+                  {cell(t, 9, <Text color={C.soft}>{bytes(one.size)}</Text>, true)}
+                  {cell(t, 9, <Text color={C.line}>{ago(now - one.mtimeMs)}</Text>, true)}
+                  {cell(
+                    t,
+                    3,
+                    <Button
+                      key={`art-copy:${index}`}
+                      label="⧉"
+                      plain
+                      dimColor
+                      onPress={async press => {
+                        const copied = await $.ui.copy({ text: absolute(one.path, await rootOf($)), surface: press.surface })
+                        $.ui.toast(copied.isCopied ? `Copied ${one.path}` : 'Workbench: could not copy here.')
+                      }}
+                    />,
+                    true,
+                  )}
+                </Box>
+              )
+            })}
+          </Box>
+        )
+      })}
+      {footer(t, [{ key: 'art-refresh', hotkey: 'r', label: 'refresh', onPress: () => refreshArtifacts($) }], width)}
+    </Box>
+  )
+}
+
+// ── Code Map ────────────────────────────────────────────────────────────
+
+function layerName(level: number, top: number): string {
+  if (level === top && top > 0) return `LAYER ${level} · entry points`
+  if (level === 0) return 'LAYER 0 · foundations'
+  return `LAYER ${level}`
+}
+
+function mapGraphView($: EngineInterface, t: T, graph: Graph, edits: readonly EditRecord[], focus: string | null, width: number): RenderNode {
+  const { Box, Button, Text } = t
+  const editedFiles = new Set(edits.map(edit => edit.file))
+  const edited = new Map<string, number>()
+  for (const file of editedFiles) edited.set(groupOf(file), (edited.get(groupOf(file)) ?? 0) + 1)
+  const levels = [...new Set(graph.groups.map(group => group.level))].sort((a, b) => b - a)
+  const top = levels[0] ?? 0
+  const most = Math.max(1, ...graph.groups.map(group => group.lines))
+  const barWidth = width >= 70 ? 14 : 8
+  const nameWidth = Math.max(10, width - 2 - (barWidth + 1) - 9 - 8 - 5)
+  const names = (list: readonly string[]): string => (list.length === 0 ? 'nothing in the repo' : list.join(', '))
+
+  return (
+    <Box flexDirection="column">
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text color={C.soft}>
+          {graph.files} files · {graph.groups.length} folders · {graph.isGit ? 'git' : 'folder mode (no git)'}
+          {graph.isTruncated ? ' · largest shown' : ''}
+        </Text>
+        <Text color={C.warn}>✎ edited</Text>
+      </Box>
+      {levels.map(level => (
+        <Box key={`lv-${level}`} flexDirection="column">
+          {section(t, layerName(level, top), width)}
+          {graph.groups
+            .filter(group => group.level === level)
+            .map(group => {
+              const count = edited.get(group.id)
+              const isFocused = group.id === focus
+              const cells = Math.max(1, Math.round((group.lines / most) * barWidth))
+              const outgoing = graph.edges.filter(edge => edge.from === group.id).map(edge => `${edge.to} (${edge.count})`)
+              const incoming = graph.edges.filter(edge => edge.to === group.id).map(edge => `${edge.from} (${edge.count})`)
+              return (
+                <Box key={`grp-${group.id}`} flexDirection="column">
+                  <Box flexDirection="row">
+                    {cell(t, 2, <Text color={isFocused ? C.accent : C.line}>{isFocused ? '▾' : '▸'}</Text>)}
+                    {cell(
+                      t,
+                      nameWidth,
+                      <Button key={`g:${group.id}`} label={tail(group.id, nameWidth - 1)} plain onPress={() => update($, mapFocusAtom, now => (now === group.id ? null : group.id))} />,
+                    )}
+                    {cell(t, barWidth + 1, <Text color={count === undefined ? C.accent : C.warn}>{'▮'.repeat(cells)}</Text>)}
+                    {cell(t, 9, <Text color={C.soft}>{group.files} file{group.files === 1 ? '' : 's'}</Text>, true)}
+                    {cell(t, 8, <Text color={C.line}>{shortCount(group.lines)} ln</Text>, true)}
+                    {cell(t, 5, <Text color={C.warn}>{count === undefined ? '' : `✎${count}`}</Text>, true)}
+                  </Box>
+                  {isFocused && (
+                    <Box flexDirection="column" paddingLeft={2} marginBottom={1}>
+                      <Text color={C.soft} wrap="truncate-end">
+                        <Text color={C.ok}>→ imports </Text>
+                        {names(outgoing)}
+                      </Text>
+                      <Text color={C.soft} wrap="truncate-end">
+                        <Text color={C.blue}>← used by </Text>
+                        {names(incoming)}
+                      </Text>
+                      <Text color={C.soft}>
+                        {group.symbols} functions and classes{group.files > group.paths.length ? ` · first ${group.paths.length} files` : ''}
+                      </Text>
+                      {group.paths.map((file, index) => (
+                        <Box key={`mfr-${index}`} flexDirection="row">
+                          {cell(t, 2, <Text color={C.warn}>{editedFiles.has(file) ? '✎' : ' '}</Text>)}
+                          <Button key={`mf:${group.id}:${index}`} label={file.slice(group.id === '.' ? 0 : group.id.length + 1) || file} plain dimColor={!editedFiles.has(file)} onPress={() => loadOutline($, file)} />
+                        </Box>
+                      ))}
+                    </Box>
+                  )}
                 </Box>
               )
             })}
@@ -1017,125 +1364,113 @@ function artifactsView($: EngineInterface, t: T, artifacts: readonly Artifact[],
   )
 }
 
-function mapGraphView($: EngineInterface, t: T, graph: Graph, edits: readonly EditRecord[], focus: string | null): RenderNode {
+function componentsView($: EngineInterface, t: T, outline: Outline | null, width: number): RenderNode {
   const { Box, Button, Text } = t
-  const edited = new Map<string, number>()
-  for (const edit of edits) edited.set(groupOf(edit.file), (edited.get(groupOf(edit.file)) ?? 0) + 1)
-  const levels = [...new Set(graph.groups.map(group => group.level))].sort((a, b) => b - a)
-  const focused = graph.groups.find(group => group.id === focus)
-  const files = [...new Set(edits.map(edit => edit.file))].filter(file => focused !== undefined && groupOf(file) === focused.id)
+  if (outline === null) return empty(t, 'ƒ', 'No file open', 'Pick a file in Changes, or a file under a folder in Architecture, to see its classes and functions and what each calls.')
+  if (outline.status === 'loading') return <Text color={C.live}>Reading {outline.file}…</Text>
+  if (outline.status === 'error') return <Text color={C.bad}>{outline.error}</Text>
+  const changed = outline.entries.filter(entry => entry.isChanged).length
+  const longest = Math.max(1, ...outline.entries.map(entry => entry.endLine - entry.line + 1))
+  const barWidth = width >= 70 ? 12 : 6
+  const nameWidth = Math.max(10, width - 12 - barWidth - 3)
   return (
     <Box flexDirection="column">
-      <Box flexDirection="row" gap={2}>
-        <Text dimColor>
-          {graph.files} files · {graph.groups.length} folders{graph.isGit ? '' : ' · folder mode (no git)'}
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text bold color={C.text}>
+          {tail(outline.file, Math.max(10, width - 30))}
         </Text>
-        <Text color={C.warn}>■ edited this session</Text>
-        <Text dimColor>■ untouched</Text>
+        <Text color={C.soft}>
+          {outline.lines} lines · {outline.entries.length} parts{changed > 0 ? ' · ' : ''}
+          {changed > 0 && <Text color={C.warn}>{changed} changed</Text>}
+        </Text>
       </Box>
-      {levels.map((level, index) => (
-        <Box key={`lv-${level}`} flexDirection="column">
-          {index > 0 && <Text dimColor>{'   ▼ imports'}</Text>}
-          <Box flexDirection="row" flexWrap="wrap" gap={1}>
-            <Box width={4} flexShrink={0}>
-              <Text dimColor>L{level}</Text>
-            </Box>
-            {graph.groups
-              .filter(group => group.level === level)
-              .map(group => {
-                const count = edited.get(group.id)
-                return (
-                  <Box key={`grp-${group.id}`} flexDirection="column" borderStyle={group.id === focus ? 'double' : 'round'} borderColor={count === undefined ? C.line : C.warn} paddingX={1}>
-                    <Button key={`g:${group.id}`} label={group.id} plain onPress={() => update($, mapFocusAtom, now => (now === group.id ? null : group.id))} />
-                    <Text dimColor>
-                      {group.files} files · {shortCount(group.lines)} lines
+      {outline.entries.length === 0 && <Text dimColor> No classes or functions found in this file.</Text>}
+      <Box flexDirection="column" marginTop={1}>
+        {outline.entries.map((entry, index) => {
+          const size = entry.endLine - entry.line + 1
+          const indent = '  '.repeat(entry.depth)
+          const color = entry.isChanged ? C.warn : entry.kind === 'class' ? C.accent : C.live
+          return (
+            <Box key={`oe-${index}`} flexDirection="column">
+              <Box flexDirection="row">
+                {cell(
+                  t,
+                  nameWidth,
+                  <Box flexDirection="row">
+                    <Text color={color}>
+                      {indent}
+                      {KIND_ICON_CODE[entry.kind]}{' '}
                     </Text>
-                    {count !== undefined && <Text color={C.warn}>✎ {count}</Text>}
-                  </Box>
-                )
-              })}
-          </Box>
-        </Box>
-      ))}
-      {focused !== undefined && (
-        <Box flexDirection="column" borderStyle="round" borderColor={C.accent} paddingX={1} marginTop={1}>
-          <Text bold color={C.accent}>
-            {focused.id} · {focused.symbols} functions and classes · layer L{focused.level}
-          </Text>
-          <Text>imports → {graph.edges.filter(edge => edge.from === focused.id).map(edge => `${edge.to} (${edge.count})`).join(', ') || 'nothing in the repo'}</Text>
-          <Text>used by ← {graph.edges.filter(edge => edge.to === focused.id).map(edge => `${edge.from} (${edge.count})`).join(', ') || 'nothing in the repo'}</Text>
-          {files.map((file, index) => (
-            <Button key={`mf:${index}`} label={`▸ ${file}`} plain onPress={() => loadOutline($, file)} />
-          ))}
-        </Box>
+                    {entry.kind === 'class' ? (
+                      <Text bold color={C.text}>
+                        {entry.name}
+                      </Text>
+                    ) : (
+                      <Button key={`oc:${index}`} label={entry.name} plain onPress={() => loadCalls($, entry.name)} />
+                    )}
+                  </Box>,
+                )}
+                {cell(
+                  t,
+                  12,
+                  <Text color={C.line}>
+                    L{entry.line}–{entry.endLine}
+                  </Text>,
+                )}
+                {cell(t, barWidth + 1, <Text color={entry.isChanged ? C.warn : C.chip}>{'▮'.repeat(Math.max(1, Math.round((size / longest) * barWidth)))}</Text>)}
+                {cell(t, 2, <Text color={C.warn}>{entry.isChanged ? '●' : ''}</Text>)}
+              </Box>
+              {entry.calls.length > 0 && (
+                <Text color={C.line} wrap="truncate-end">
+                  {indent}
+                  {'    '}→ {entry.calls.join(', ')}
+                </Text>
+              )}
+            </Box>
+          )
+        })}
+      </Box>
+      {changed > 0 && (
+        <Text color={C.line}>
+          <Text color={C.warn}>●</Text> changed this session
+        </Text>
       )}
     </Box>
   )
 }
 
-function componentsView($: EngineInterface, t: T, outline: Outline | null, columns: number): RenderNode {
-  const { Box, Button, Text } = t
-  if (outline === null) return empty(t, 'Pick a file in Changes, or a touched file in the map, to see its classes, functions and what each calls.')
-  if (outline.status === 'loading') return <Text color={C.live}>Reading {outline.file}…</Text>
-  if (outline.status === 'error') return <Text color={C.bad}>{outline.error}</Text>
-  const longest = Math.max(1, ...outline.entries.map(entry => entry.endLine - entry.line + 1))
-  const barWidth = Math.max(6, Math.min(24, Math.floor(columns * 0.2)))
-  return (
-    <Box flexDirection="column">
-      <Text bold>
-        {outline.file} · {outline.lines} lines · {outline.entries.length} components ·{' '}
-        <Text color={C.warn}>{outline.entries.filter(entry => entry.isChanged).length} changed</Text>
-      </Text>
-      {outline.entries.map((entry, index) => {
-        const size = entry.endLine - entry.line + 1
-        return (
-          <Box key={`oe-${index}`} flexDirection="column">
-            <Box flexDirection="row" gap={1}>
-              <Text>{'  '.repeat(entry.depth)}</Text>
-              <Text color={entry.isChanged ? C.warn : entry.kind === 'class' ? C.accent : C.live}>{KIND_ICON_CODE[entry.kind]}</Text>
-              {entry.kind === 'class' ? (
-                <Text bold>{entry.name}</Text>
-              ) : (
-                <Button key={`oc:${index}`} label={entry.name} plain onPress={() => loadCalls($, entry.name)} />
-              )}
-              <Text dimColor>
-                L{entry.line}-{entry.endLine}
-              </Text>
-              <Text color={entry.isChanged ? C.warn : C.line}>{'▇'.repeat(Math.max(1, Math.round((size / longest) * barWidth)))}</Text>
-              {entry.isChanged && <Text color={C.warn}>● changed</Text>}
-            </Box>
-            {entry.calls.length > 0 && (
-              <Text dimColor wrap="truncate-end">
-                {'  '.repeat(entry.depth + 2)}→ {entry.calls.join(', ')}
-              </Text>
-            )}
-          </Box>
-        )
-      })}
-    </Box>
-  )
-}
-
-function callsView($: EngineInterface, t: T, call: CallView | null, trail: readonly string[], ask: RenderNode | null): RenderNode {
+function callsView($: EngineInterface, t: T, call: CallView | null, trail: readonly string[], ask: RenderNode | null, width: number): RenderNode {
   const { Box, Button, Text } = t
   const previous = call === null ? undefined : trail[trail.indexOf(call.symbol) - 1]
-  const site = (one: Site, key: string): RenderNode => (
-    <Box key={`row-${key}`} flexDirection="row" gap={1}>
-      <Text dimColor>{'   ├'}</Text>
-      {one.isKnown ? <Button key={key} label={one.symbol} plain onPress={() => loadCalls($, one.symbol)} /> : <Text dimColor>{one.symbol}</Text>}
-      <Text dimColor wrap="truncate-end">
-        {one.file === '' ? '(outside the repo)' : `${one.file}:${one.line}`}
+  const site = (one: Site, key: string, arrow: string, color: string): RenderNode => (
+    <Box key={`row-${key}`} flexDirection="row">
+      {cell(t, 3, <Text color={color}>{arrow}</Text>)}
+      {cell(
+        t,
+        Math.max(10, Math.floor((width - 3) / 2)),
+        one.isKnown ? (
+          <Button key={key} label={one.symbol} plain onPress={() => loadCalls($, one.symbol)} />
+        ) : (
+          <Text color={C.line} wrap="truncate-end">
+            {one.symbol}
+          </Text>
+        ),
+      )}
+      <Text color={C.line} wrap="truncate-start">
+        {one.file === '' ? 'outside the repo' : `${one.file}:${one.line}`}
       </Text>
     </Box>
   )
   return (
     <Box flexDirection="column">
       {ask}
-      <Box flexDirection="row" gap={1}>
+      <Box flexDirection="row" columnGap={2}>
         <Button
           key="calls-selection"
-          label="use my selection"
+          label="trace my selection"
           hotkey="s"
+          plain
+          dimColor
           onPress={async () => {
             const selected = await $.ui.selection()
             const symbol = selected === undefined ? null : symbolFromSelection(selected.text)
@@ -1143,120 +1478,153 @@ function callsView($: EngineInterface, t: T, call: CallView | null, trail: reado
             else await loadCalls($, symbol)
           }}
         />
-        {previous !== undefined && <Button key="calls-back" label={`back to ${previous}`} hotkey="b" onPress={() => loadCalls($, previous, true)} />}
+        {previous !== undefined && <Button key="calls-back" label={`‹ ${previous}`} hotkey="b" plain dimColor onPress={() => loadCalls($, previous, true)} />}
       </Box>
-      {call === null && empty(t, 'Type a function name, or select one in the transcript.')}
+      {call === null && empty(t, 'ƒ', 'Trace a function', 'Type a function or class name above, select one in the transcript, or click a function in Changes or Components.')}
       {call?.status === 'loading' && <Text color={C.live}>Tracing {call.symbol}…</Text>}
-      {(call?.status === 'error' || call?.status === 'missing') && (
-        <Text color={C.bad}>{call.status === 'missing' ? `No definition or calls of ${call.symbol} found.` : call.error}</Text>
-      )}
+      {(call?.status === 'error' || call?.status === 'missing') && <Text color={C.bad}>{call.status === 'missing' ? `No definition or calls of ${call.symbol} found.` : call.error}</Text>}
       {call?.status === 'ready' && (
         <Box flexDirection="column" marginTop={1}>
           {trail.length > 1 && (
-            <Text dimColor wrap="truncate-start">
+            <Text color={C.line} wrap="truncate-start">
               {trail.join(' › ')}
             </Text>
           )}
-          <Box flexDirection="row" gap={1}>
+          <Box flexDirection="row" justifyContent="space-between">
             <Text bold color={C.live}>
               ƒ {call.symbol}
             </Text>
-            <Text dimColor>{call.definition === undefined ? 'definition not found' : `${call.definition.file}:${call.definition.line}`}</Text>
+            <Text color={C.soft}>{call.definition === undefined ? 'definition not found' : `${call.definition.file}:${call.definition.line}`}</Text>
           </Box>
-          <Text bold color={C.accent}>
-            ▲ Called by ({call.callers.length})
-          </Text>
-          {call.callers.length === 0 && <Text dimColor> no callers found</Text>}
-          {call.callers.map((one, index) => site(one, `caller:${index}`))}
-          <Text bold color={C.ok}>
-            ▼ Calls ({call.callees.filter(one => one.isKnown).length} in the repo)
-          </Text>
-          {call.callees.map((one, index) => site(one, `callee:${index}`))}
+          {section(t, 'CALLED BY', width, String(call.callers.length))}
+          {call.callers.length === 0 && <Text dimColor> No callers found.</Text>}
+          {call.callers.map((one, index) => site(one, `caller:${index}`, '←', C.blue))}
+          {section(t, 'CALLS', width, `${call.callees.filter(one => one.isKnown).length} in the repo`)}
+          {call.callees.length === 0 && <Text dimColor> Calls nothing.</Text>}
+          {call.callees.map((one, index) => site(one, `callee:${index}`, '→', C.ok))}
         </Box>
       )}
     </Box>
   )
 }
 
-function usageView(t: T, limits: readonly Limit[], reading: Reading | null, history: readonly number[], turns: readonly Turn[], costUsd: number | null, now: number, columns: number): RenderNode {
+// ── Usage ───────────────────────────────────────────────────────────────
+
+function usageView(t: T, limits: readonly Limit[], reading: Reading | null, history: readonly number[], turns: readonly Turn[], costUsd: number | null, now: number, width: number): RenderNode {
   const { Box, Text } = t
-  const barWidth = Math.max(16, Math.min(40, Math.floor(columns * 0.35)))
+  const barWidth = clamp(width - 8 - 6 - 22, 8, 32)
   const costed = turns.filter(turn => turn.costUsd !== undefined || turn.outputTokens !== undefined).slice(-12)
   const maxCost = Math.max(0.0001, ...costed.map(turn => turn.costUsd ?? 0))
   const maxTokens = Math.max(1, ...costed.map(turn => (turn.inputTokens ?? 0) + (turn.outputTokens ?? 0)))
   return (
     <Box flexDirection="column">
-      {heading(t, 'Plan limits')}
+      {section(t, 'PLAN LIMITS', width)}
       {limits.length === 0 && <Text dimColor> No reading yet: limits appear after a reply on a Claude subscription.</Text>}
       {limits.map(limit => {
         const view = viewOf(limit, now)
         const filled = meter(view.percent, barWidth)
+        const color = hue(view.color)
         const reset = limit.resetsAt === undefined ? Number.NaN : Date.parse(limit.resetsAt)
         const windowMs = limit.kind === 'five_hour' ? 5 * 3_600_000 : limit.kind === 'seven_day' ? 7 * 86_400_000 : 0
         const elapsed = Number.isNaN(reset) || windowMs === 0 ? 0 : now - (reset - windowMs)
         const projected = elapsed > 5 * 60_000 ? Math.round((limit.percentUsed / elapsed) * windowMs) : undefined
         return (
-          <Box key={`ul-${limit.kind}`} flexDirection="column" marginTop={1} borderStyle="round" borderColor={hue(view.color)} paddingX={1}>
-            <Box flexDirection="row" gap={1}>
-              <Box width={8} flexShrink={0}>
-                <Text bold>{view.label}</Text>
-              </Box>
+          <Box key={`ul-${limit.kind}`} flexDirection="column">
+            <Box flexDirection="row">
+              {cell(
+                t,
+                8,
+                <Text bold color={C.text}>
+                  {view.label}
+                </Text>,
+              )}
               <Text>
-                <Text color={hue(view.color)}>{filled.used}</Text>
-                <Text dimColor>{filled.left}</Text>
+                <Text color={color}>{filled.used}</Text>
+                <Text color={C.chip}>{filled.left}</Text>
               </Text>
-              <Text bold color={hue(view.color)}>
-                {Math.round(view.percent)}%
+              {cell(
+                t,
+                6,
+                <Text bold color={color}>
+                  {Math.round(view.percent)}%
+                </Text>,
+                true,
+              )}
+              <Text color={C.soft} wrap="truncate-end">
+                {view.resetIn === undefined ? '' : `  ↻ ${view.resetIn} · ${view.resetAt}`}
               </Text>
             </Box>
-            <Text dimColor>
-              {'         '}
-              {view.resetIn === undefined ? 'reset time unknown' : `↻ resets in ${view.resetIn} · at ${view.resetAt}`}
-              {projected === undefined ? '' : ` · on pace for ${projected}% by the reset`}
-            </Text>
-            {view.runsOutIn !== undefined && (
-              <Text color={view.percent >= 70 ? C.bad : C.warn}>
-                {'         '}⚠ at this pace you run out in {view.runsOutIn}, before the reset
-              </Text>
+            {(projected !== undefined || view.runsOutIn !== undefined) && (
+              <Box paddingLeft={8}>
+                {view.runsOutIn !== undefined ? (
+                  <Text color={view.percent >= 70 ? C.bad : C.warn} wrap="truncate-end">
+                    ⚠ runs out in {view.runsOutIn} at this pace{projected === undefined ? '' : ` (on pace for ${projected}%)`}
+                  </Text>
+                ) : (
+                  <Text color={C.line} wrap="truncate-end">
+                    on pace for {projected}% by the reset
+                  </Text>
+                )}
+              </Box>
             )}
           </Box>
         )
       })}
-      <Box marginTop={1}>{heading(t, 'Context window')}</Box>
+
+      {section(t, 'CONTEXT WINDOW', width)}
       {reading === null ? (
         <Text dimColor> No reading yet.</Text>
       ) : (
-        <Box flexDirection="row" gap={1}>
-          <Text color={hue(sky(reading.percent).color)} bold>
-            {' '}
-            {sky(reading.percent).icon} {sky(reading.percent).label}
-          </Text>
-          <Text>
-            {reading.percent}% · {kilo(reading.tokens)} of {kilo(reading.window)}
-          </Text>
-          <Text color={C.live}>{sparkline(history)}</Text>
-          <Text dimColor>{outlook(history, reading)}</Text>
+        <Box flexDirection="column">
+          <Box flexDirection="row">
+            {cell(
+              t,
+              8,
+              <Text bold color={hue(sky(reading.percent).color)}>
+                {sky(reading.percent).icon} {sky(reading.percent).label}
+              </Text>,
+            )}
+            <Text>
+              <Text color={hue(sky(reading.percent).color)}>{meter(reading.percent, barWidth).used}</Text>
+              <Text color={C.chip}>{meter(reading.percent, barWidth).left}</Text>
+            </Text>
+            {cell(
+              t,
+              6,
+              <Text bold color={hue(sky(reading.percent).color)}>
+                {reading.percent}%
+              </Text>,
+              true,
+            )}
+            <Text color={C.soft}>
+              {'  '}
+              {kilo(reading.tokens)} / {kilo(reading.window)}
+            </Text>
+          </Box>
+          <Box paddingLeft={8} flexDirection="row" columnGap={1}>
+            <Text color={C.live}>{sparkline(history)}</Text>
+            <Text color={C.line} wrap="truncate-end">
+              {outlook(history, reading)}
+              {sky(reading.percent).advice === undefined ? '' : ` · ${sky(reading.percent).advice}`}
+            </Text>
+          </Box>
         </Box>
       )}
-      <Box marginTop={1}>{heading(t, 'Cost per turn', costUsd === null ? 'tokens only: no cost ledger here' : `session total $${costUsd.toFixed(2)}`)}</Box>
+
+      {section(t, 'COST PER TURN', width, costUsd === null ? 'tokens only' : `$${costUsd.toFixed(2)} this session`)}
       {costed.length === 0 && <Text dimColor> Turns appear here as they finish.</Text>}
       {costed.map((turn, index) => {
         const value = turn.costUsd ?? 0
         const tokens = (turn.inputTokens ?? 0) + (turn.outputTokens ?? 0)
         const share = turn.costUsd === undefined ? tokens / maxTokens : value / maxCost
         return (
-          <Box key={`uc-${turn.id}`} flexDirection="row" gap={1}>
-            <Box width={5} flexShrink={0}>
-              <Text dimColor>T{turns.indexOf(turn) + 1}</Text>
-            </Box>
-            <Box width={barWidth} flexShrink={0}>
-              <Text color={index === costed.length - 1 ? C.live : C.accent}>{'█'.repeat(Math.max(1, Math.round(share * barWidth)))}</Text>
-            </Box>
-            <Box width={8} flexShrink={0}>
-              <Text>{turn.costUsd === undefined ? '' : `$${value.toFixed(3)}`}</Text>
-            </Box>
-            <Text dimColor wrap="truncate-end">
-              {kilo(turn.inputTokens ?? 0)} in · {kilo(turn.outputTokens ?? 0)} out · “{turn.prompt.slice(0, 40)}”
+          <Box key={`uc-${turn.id}`} flexDirection="row">
+            {cell(t, 5, <Text color={C.soft}>T{turns.indexOf(turn) + 1}</Text>)}
+            {cell(t, barWidth + 1, <Text color={index === costed.length - 1 ? C.live : C.accent}>{'▮'.repeat(Math.max(1, Math.round(share * barWidth)))}</Text>)}
+            {cell(t, 8, <Text color={C.text}>{turn.costUsd === undefined ? '' : `$${value.toFixed(3)}`}</Text>, true)}
+            <Text color={C.line} wrap="truncate-end">
+              {'  '}
+              {kilo(turn.inputTokens ?? 0)} in · {kilo(turn.outputTokens ?? 0)} out
             </Text>
           </Box>
         )
@@ -1317,7 +1685,7 @@ export const register: Register = on => {
 
   on('turn.start', async ($, e, next) => {
     const now = await $.clock.now()
-    const turn: Turn = { id: e.turnId, prompt: e.text.replace(/\s+/g, ' ').slice(0, 100), startedAt: now, status: 'running', steps: [], lanes: [{ id: 'main', label: 'Main' }] }
+    const turn: Turn = { id: e.turnId, prompt: promptLabel(e.text), startedAt: now, status: 'running', steps: [], lanes: [{ id: 'main', label: 'Main' }] }
     await update($, turnsAtom, list => [...list, turn].slice(-Math.max(MAX_TURNS, 30)))
     await update($, turnBackAtom, () => 0)
     isBusy = true
@@ -1393,8 +1761,11 @@ export const register: Register = on => {
     const status = e.reason === 'aborted' ? 'interrupted' : e.reason === 'answer' ? 'done' : 'failed'
     const costNow = usage.cost?.usd
     const costUsd = costNow === undefined || turnCostStart === null ? undefined : Math.max(0, costNow - turnCostStart)
+    // Cached reads and writes are input too: without them a turn reads as a handful of tokens.
+    const inputTokens =
+      e.usage === undefined ? undefined : (e.usage.input_tokens ?? 0) + (e.usage.cache_creation_input_tokens ?? 0) + (e.usage.cache_read_input_tokens ?? 0)
     await update($, turnsAtom, list =>
-      onNewest(list, endedAt, turn => ({ ...turn, endedAt, status, inputTokens: e.usage?.input_tokens, outputTokens: e.usage?.output_tokens, costUsd })),
+      onNewest(list, endedAt, turn => ({ ...turn, endedAt, status, inputTokens, outputTokens: e.usage?.output_tokens, costUsd })),
     )
     isBusy = false
     const reading = toReading(usage.context)
@@ -1433,13 +1804,18 @@ export const register: Register = on => {
       await update($, changeFileAtom, () => null)
       await update($, changeEditAtom, () => null)
       await update($, historyAtom, () => [])
-      editBaselines.clear()
+      await update($, baselinesAtom, (): Baselines => ({}))
     }
     return next(e)
   })
 
   on('command.run', { command: 'wb' }, async ($, e) => {
-    await $.ui.open({ id: PANE, title: TITLE })
+    const opened = await $.ui.open({ id: PANE, title: TITLE, focus: true, columns: PANE_COLUMNS })
+    if (!opened.isPlaced) $.ui.toast(`Workbench is waiting for room: ${opened.reason}`)
+    else if (!hasHinted) {
+      hasHinted = true
+      $.ui.toast("Workbench is open. If Claude Code's diff panel covers it, run /diff to hide that panel.")
+    }
     await openTab($, e.args)
     if ((await read($, tabAtom)) === 'artifacts') await refreshArtifacts($)
 
@@ -1463,64 +1839,73 @@ export const register: Register = on => {
     const isBelowDrawn = hasContent(below)
     if (limits.length === 0 && reading === null && turns.length === 0 && !isBelowDrawn) return below
 
-    const wide = e.props.bodyColumns >= 120
-    const dot = (isOn: boolean): RenderNode => <Text color={isOn ? C.accent : C.line}>{isOn ? '●' : '○'}</Text>
-    const name = (label: string, isOn: boolean): RenderNode => (
-      <Text bold={isOn} color={isOn ? C.accent : C.soft}>
-        {label}
-      </Text>
-    )
+    const columns = e.props.bodyColumns
+    const isForecast = slide === 'forecast'
+    const sep = <Text color={C.line}> · </Text>
 
     const nav = (
-      <Box flexDirection="row" gap={1}>
-        <Button key="hud-left" label="◀" plain dimColor={slide === 'forecast'} onPress={() => update($, slideAtom, () => 'forecast')} />
-        {dot(slide === 'forecast')}
-        {name('Forecast', slide === 'forecast')}
-        <Text color={C.line}> </Text>
-        {dot(slide === 'workbench')}
-        {name('Workbench', slide === 'workbench')}
-        <Button key="hud-right" label="▶" plain dimColor={slide === 'workbench'} onPress={() => update($, slideAtom, () => 'workbench')} />
-        <Text color={C.line}>│</Text>
+      <Box flexDirection="row" columnGap={1}>
+        <Button key="hud-left" label="◀" plain dimColor={isForecast} onPress={() => update($, slideAtom, () => 'forecast')} />
+        <Text bold color={C.accent}>
+          {isForecast ? 'Forecast' : 'Workbench'}
+        </Text>
+        <Text color={C.line}>{isForecast ? '●○' : '○●'}</Text>
+        <Button key="hud-right" label="▶" plain dimColor={!isForecast} onPress={() => update($, slideAtom, () => 'workbench')} />
+      </Box>
+    )
+    // The engine draws its own collapse mark at the band's right edge: keep clear of it.
+    const controls = (
+      <Box flexDirection="row" columnGap={2} marginRight={4}>
         <Button
           key="hud-open"
           label="open ▸"
           plain
+          dimColor
           onPress={async () => {
-            const running = (await read($, turnsAtom)).at(-1)?.steps.some(step => step.status === 'running') ?? false
-            const target: Tab = slide === 'forecast' ? 'usage' : running ? 'now' : (await read($, editsAtom)).length > 0 ? 'changes' : 'now'
+            const isRunning = (await read($, turnsAtom)).at(-1)?.steps.some(step => step.status === 'running') ?? false
+            const target: Tab = isForecast ? 'usage' : isRunning ? 'now' : (await read($, editsAtom)).length > 0 ? 'changes' : 'now'
             await update($, tabAtom, () => target)
-            await $.ui.open({ id: PANE, title: TITLE })
+            await $.ui.open({ id: PANE, title: TITLE, focus: true, columns: PANE_COLUMNS })
           }}
         />
-        <Button key="hud-hide" label="hide" plain dimColor onPress={() => update($, hudHiddenAtom, () => true)} />
+        <Button key="hud-hide" label="✕" plain dimColor onPress={() => update($, hudHiddenAtom, () => true)} />
+      </Box>
+    )
+    const topRow = (content: RenderNode | null): RenderNode => (
+      <Box flexDirection="row" justifyContent="space-between">
+        <Box flexDirection="row" columnGap={2} flexWrap="wrap" flexShrink={1}>
+          {nav}
+          {content}
+        </Box>
+        {controls}
       </Box>
     )
 
-    if (slide === 'forecast') {
+    if (isForecast) {
       if (isBelowDrawn) {
         return (
           <Box flexDirection="column">
-            {nav}
+            {topRow(null)}
             {below}
           </Box>
         )
       }
-      const barWidth = wide ? 18 : 10
+      const barWidth = columns >= 120 ? 18 : 10
       return (
         <Box flexDirection="column">
-          {nav}
+          {topRow(null)}
           {limits.length === 0 && reading === null && <Text color={C.soft}> No plan or context reading yet: it appears after the first reply.</Text>}
           {limits.map(limit => {
             const view = viewOf(limit, now)
             const gauge = meter(view.percent, barWidth)
             return (
-              <Box key={`fc-${limit.kind}`} flexDirection="row" gap={1}>
+              <Box key={`fc-${limit.kind}`} flexDirection="row" columnGap={1}>
                 <Box width={8} flexShrink={0}>
                   <Text bold>{view.label}</Text>
                 </Box>
                 <Text>
                   <Text color={hue(view.color)}>{gauge.used}</Text>
-                  <Text color={C.line}>{gauge.left}</Text>
+                  <Text color={C.chip}>{gauge.left}</Text>
                 </Text>
                 <Box width={5} flexShrink={0} justifyContent="flex-end">
                   <Text bold color={hue(view.color)}>
@@ -1541,7 +1926,7 @@ export const register: Register = on => {
             )
           })}
           {reading !== null && (
-            <Box flexDirection="row" gap={1}>
+            <Box flexDirection="row" columnGap={1}>
               <Box width={8} flexShrink={0}>
                 <Text bold>Context</Text>
               </Box>
@@ -1568,88 +1953,91 @@ export const register: Register = on => {
     const removed = edits.reduce((sum, edit) => sum + edit.removed, 0)
     const running = turns.at(-1)?.steps.findLast(step => step.status === 'running')
     const last = edits.at(-1)
-    const firstMinus = last?.hunks.flatMap(hunk => hunk.lines).find(line => line.startsWith('-'))
-    const firstPlus = last?.hunks.flatMap(hunk => hunk.lines).find(line => line.startsWith('+'))
-    const dotSep = <Text color={C.line}>·</Text>
+    const gaugeWidth = columns >= 140 ? 6 : 4
+
+    const metrics = (
+      <Box flexDirection="row" flexWrap="wrap">
+        <Text>
+          <Text color={C.soft}>⏱ </Text>
+          <Text bold color={C.text}>
+            {startedAt > 0 ? duration(now - startedAt) : '–'}
+          </Text>
+          <Text color={C.soft}> · {tools} tools</Text>
+        </Text>
+        {sep}
+        <Text>
+          <Text color={C.warn}>✎ </Text>
+          <Text bold color={C.text}>
+            {files}
+          </Text>
+          <Text color={C.soft}> file{files === 1 ? '' : 's'} </Text>
+          <Text color={C.ok}>+{added}</Text> <Text color={C.bad}>−{removed}</Text>
+        </Text>
+        {artifacts.length > 0 && (
+          <Text>
+            <Text color={C.line}> · </Text>
+            <Text color={C.accent}>✦ </Text>
+            <Text bold color={C.text}>
+              {artifacts.length}
+            </Text>
+            <Text color={C.soft}> new</Text>
+          </Text>
+        )}
+        {(columns >= 110 ? limits.slice(0, 2) : []).map(limit => {
+          const view = viewOf(limit, now)
+          const gauge = pill(view.percent, gaugeWidth)
+          return (
+            <Box key={`hud-${limit.kind}`} flexDirection="row">
+              {sep}
+              <Text color={C.soft}>{limit.kind === 'five_hour' ? '5h ' : limit.kind === 'seven_day' ? 'wk ' : `${view.label} `}</Text>
+              <Text color={hue(view.color)}>{gauge.used}</Text>
+              <Text color={C.chip}>{gauge.left}</Text>
+              <Text bold color={hue(view.color)}>
+                {' '}
+                {Math.round(view.percent)}%
+              </Text>
+              {view.runsOutIn !== undefined && <Text color={C.bad}> ⚠</Text>}
+            </Box>
+          )
+        })}
+        {reading !== null && (
+          <Box flexDirection="row">
+            {sep}
+            <Text color={C.soft}>ctx </Text>
+            <Text bold color={hue(sky(reading.percent).color)}>
+              {reading.percent}%
+            </Text>
+          </Box>
+        )}
+      </Box>
+    )
 
     return (
       <Box flexDirection="column">
-        {nav}
-        <Box flexDirection="row" columnGap={1} flexWrap="wrap">
-          {limits.slice(0, 2).map(limit => {
-            const view = viewOf(limit, now)
-            const gauge = pill(view.percent, wide ? 8 : 5)
-            return (
-              <Box key={`hud-${limit.kind}`} flexDirection="row" gap={1}>
-                <Text color={C.soft}>{limit.kind === 'five_hour' ? '5h' : limit.kind === 'seven_day' ? 'Wk' : view.label}</Text>
-                <Text>
-                  <Text color={hue(view.color)}>{gauge.used}</Text>
-                  <Text color={C.line}>{gauge.left}</Text>
-                </Text>
-                <Text bold color={hue(view.color)}>
-                  {Math.round(view.percent)}%
-                </Text>
-                {view.resetIn !== undefined && <Text color={C.soft}>↻{view.resetIn}</Text>}
-                {view.runsOutIn !== undefined && <Text color={C.bad}>⚠</Text>}
-                {dotSep}
-              </Box>
-            )
-          })}
-          {reading !== null && (
-            <Text>
-              <Text color={C.soft}>Ctx </Text>
-              <Text bold color={hue(sky(reading.percent).color)}>
-                {sky(reading.percent).icon} {reading.percent}%
-              </Text>
-            </Text>
-          )}
-          {reading !== null && dotSep}
-          <Text>
-            <Text color={C.soft}>⏱ </Text>
-            <Text bold>{startedAt > 0 ? duration(now - startedAt) : '–'}</Text>
-            <Text color={C.soft}> · </Text>
-            <Text bold>{tools}</Text>
-            <Text color={C.soft}> tools</Text>
-          </Text>
-          {dotSep}
-          <Text>
-            <Text color={C.warn}>✎ </Text>
-            <Text bold>{files}</Text>
-            <Text color={C.soft}> file{files === 1 ? '' : 's'} </Text>
-            <Text color={C.ok}>+{added}</Text> <Text color={C.bad}>−{removed}</Text>
-          </Text>
-          {artifacts.length > 0 && dotSep}
-          {artifacts.length > 0 && (
-            <Text>
-              <Text color={C.accent}>✦ </Text>
-              <Text bold>{artifacts.length}</Text>
-              <Text color={C.soft}> new</Text>
-            </Text>
-          )}
-        </Box>
+        {topRow(metrics)}
         {running !== undefined ? (
-          <Box flexDirection="row" gap={1}>
+          <Box flexDirection="row" columnGap={1}>
             <Text color={C.live}>●</Text>
             <Text bold color={C.live}>
               {running.tool}
             </Text>
             <Text color={C.soft} wrap="truncate-end">
-              {running.summary}
+              {head(running.summary, Math.max(10, columns - 30))}
             </Text>
             <Text color={C.live}>{seconds(now - running.startedAt)}</Text>
           </Box>
         ) : last !== undefined ? (
-          <Box flexDirection="row" gap={1}>
-            <Text color={C.warn}>✎</Text>
-            <Text bold>{last.file.split('/').pop()}</Text>
-            {firstMinus !== undefined && (
-              <Text color={C.bad} wrap="truncate-end">
-                {firstMinus.trim().slice(0, 60)}
-              </Text>
-            )}
-            {firstPlus !== undefined && (
-              <Text color={C.ok} wrap="truncate-end">
-                {firstPlus.trim().slice(0, 60)}
+          <Box flexDirection="row" columnGap={1}>
+            <Text color={C.line}>last edit</Text>
+            <Text bold color={C.text}>
+              {tail(last.file, Math.max(10, columns - 50))}
+            </Text>
+            <Text>
+              <Text color={C.ok}>+{last.added}</Text> <Text color={C.bad}>−{last.removed}</Text>
+            </Text>
+            {last.symbols.length > 0 && (
+              <Text color={C.warn} wrap="truncate-end">
+                ƒ {last.symbols.join(' · ')}
               </Text>
             )}
           </Box>
@@ -1664,25 +2052,26 @@ export const register: Register = on => {
     const { Box, Button, Text } = t
     const tab = await read($, tabAtom)
     const now = await $.clock.now()
-    const columns = e.props.bodyColumns
+    const width = Math.max(30, e.props.bodyColumns)
     const turns = await read($, turnsAtom)
     const edits = await read($, editsAtom)
+    const artifacts = await read($, artifactsAtom)
 
     let body: RenderNode
     if (tab === 'now') {
-      body = nowView($, t, turns, await read($, turnBackAtom), await read($, showOutputsAtom), now, columns)
+      body = nowView($, t, turns, await read($, turnBackAtom), await read($, showOutputsAtom), now, width)
     } else if (tab === 'changes') {
       const editId = await read($, changeEditAtom)
       const file = await read($, changeFileAtom)
       const edit = edits.find(one => one.id === editId)
       body =
-        edit !== undefined ? diffView($, t, edits, edit, turns, columns)
-        : file !== null ? fileView($, t, file, await read($, fileSummaryAtom), edits, turns)
-        : changesOverview($, t, edits, turns)
+        edit !== undefined ? diffView($, t, edits, edit, turns, width)
+        : file !== null ? fileView($, t, file, await read($, fileSummaryAtom), edits, turns, width)
+        : changesOverview($, t, edits, turns, width)
     } else if (tab === 'preview') {
-      body = previewView($, t, table as unknown as Record<string, unknown>, e.surface, await read($, previewAtom), await read($, followAtom), columns)
+      body = previewView($, t, table as unknown as Record<string, unknown>, e.surface, await read($, previewAtom), await read($, followAtom), recentFiles(edits, artifacts), width)
     } else if (tab === 'artifacts') {
-      body = artifactsView($, t, await read($, artifactsAtom), now)
+      body = artifactsView($, t, artifacts, now, width)
     } else if (tab === 'map') {
       const view = await read($, mapViewAtom)
       const status = await read($, scanStatusAtom)
@@ -1692,67 +2081,98 @@ export const register: Register = on => {
           <table.Input key="calls-symbol" label="Function" placeholder="name of a function or class" submitLabel="trace" onSubmit={value => void loadCalls($, value)} />
         ) : null
       const inner =
-        view === 'components' ? componentsView($, t, await read($, outlineAtom), columns)
-        : view === 'calls' ? callsView($, t, await read($, callAtom), await read($, trailAtom), ask)
+        view === 'components' ? componentsView($, t, await read($, outlineAtom), width)
+        : view === 'calls' ? callsView($, t, await read($, callAtom), await read($, trailAtom), ask, width)
         : status === 'scanning' ? <Text color={C.live}>Scanning the code…</Text>
         : status === 'error' ? <Text color={C.bad}>Scan failed: {await read($, scanErrorAtom)}</Text>
         : status === 'no-folder' ? <Text color={C.bad}>Workbench could not tell which folder to read.</Text>
         : graph === null ? <Text dimColor>Starting the first scan…</Text>
-        : mapGraphView($, t, graph, edits, await read($, mapFocusAtom))
+        : mapGraphView($, t, graph, edits, await read($, mapFocusAtom), width)
+      const views = [
+        { view: 'map', label: 'Architecture', hotkey: 'a' },
+        { view: 'components', label: 'Components', hotkey: 'm' },
+        { view: 'calls', label: 'Calls', hotkey: 'k' },
+      ] as const
       body = (
         <Box flexDirection="column">
-          <Box flexDirection="row" gap={1} marginBottom={1}>
-            {(['map', 'components', 'calls'] as const).map((one, index) => (
-              <Button
-                key={`mv:${one}`}
-                label={one === 'map' ? 'architecture' : one}
-                hotkey={['a', 'm', 'k'][index]}
-                variant={one === view ? 'primary' : 'secondary'}
-                onPress={() => update($, mapViewAtom, () => one)}
-              />
-            ))}
-            <Button key="mv-rescan" label="rescan" hotkey="x" onPress={() => scan($)} />
+          <Box flexDirection="row" justifyContent="space-between" marginBottom={1}>
+            <Box flexDirection="row" columnGap={1}>
+              {views.map(one =>
+                one.view === view ? (
+                  <Text key={`mv-on:${one.view}`} backgroundColor={C.chip} color={C.text} bold>
+                    {` ${one.label} `}
+                  </Text>
+                ) : (
+                  <Button key={`mv:${one.view}`} label={` ${one.label} `} plain dimColor onPress={() => update($, mapViewAtom, () => one.view)} />
+                ),
+              )}
+            </Box>
+            <Button key="mv-rescan" label="↻ rescan" plain dimColor onPress={() => scan($)} />
           </Box>
           {inner}
         </Box>
       )
     } else {
-      body = usageView(t, await read($, limitsAtom), await read($, readingAtom), await read($, historyAtom), turns, await read($, costAtom), now, columns)
+      body = usageView(t, await read($, limitsAtom), await read($, readingAtom), await read($, historyAtom), turns, await read($, costAtom), now, width)
     }
+
+    // Header: the name, and what Claude is doing right now.
+    const running = turns.at(-1)?.steps.findLast(step => step.status === 'running')
+    const latest = turns.at(-1)
+    const activity =
+      running !== undefined ? (
+        <Text color={C.live} wrap="truncate-end">
+          ● {running.tool} {head(running.summary, 18)} {seconds(now - running.startedAt)}
+        </Text>
+      ) : latest?.status === 'running' ? (
+        <Text color={C.live}>● thinking {seconds(now - latest.startedAt)}</Text>
+      ) : latest !== undefined ? (
+        <Text color={C.soft}>✓ idle · {turns.length} turn{turns.length === 1 ? '' : 's'}</Text>
+      ) : (
+        <Text color={C.soft}>○ waiting</Text>
+      )
+
+    // Tabs: the open one a filled pill, the rest plain buttons; counts while there is room.
+    const files = new Set(edits.map(edit => edit.file)).size
+    const showCounts = width >= 58
+    const badge = (one: Tab): string =>
+      !showCounts ? ''
+      : one === 'changes' && files > 0 ? ` ${files}`
+      : one === 'artifacts' && artifacts.length > 0 ? ` ${artifacts.length}`
+      : one === 'now' && running !== undefined ? ' ●'
+      : ''
 
     return (
       <Box flexDirection="column">
-        <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
-          <Box flexDirection="column">
-            <Text bold color={C.accent}>
-              ◆ Workbench
-            </Text>
-            <Text color={C.line}>{'─'.repeat(11)}</Text>
-          </Box>
+        <Box flexDirection="row" justifyContent="space-between" paddingRight={3}>
+          <Text bold color={C.accent}>
+            ◆ Workbench
+          </Text>
+          {activity}
+        </Box>
+        <Box flexDirection="row" columnGap={1} marginTop={1}>
           {TABS.map(one => {
-            const isActive = one.tab === tab
-            const label = `${one.icon} ${one.label}`
-            return (
-              <Box key={`tabbox-${one.tab}`} flexDirection="column">
-                <Button
-                  key={`tab:${one.tab}`}
-                  label={label}
-                  hotkey={one.key}
-                  plain
-                  dimColor={!isActive}
-                  onPress={async () => {
-                    await update($, tabAtom, () => one.tab)
-                    if (one.tab === 'artifacts') await refreshArtifacts($)
-                  }}
-                />
-                <Text color={isActive ? C.accent : C.line}>{(isActive ? '━' : '─').repeat(label.length + 3)}</Text>
-              </Box>
+            const label = ` ${one.label}${badge(one.tab)} `
+            return one.tab === tab ? (
+              <Text key={`tab-on:${one.tab}`} backgroundColor={C.accent} color={C.ink} bold>
+                {label}
+              </Text>
+            ) : (
+              <Button
+                key={`tab:${one.tab}`}
+                label={label}
+                plain
+                dimColor
+                onPress={async () => {
+                  await update($, tabAtom, () => one.tab)
+                  if (one.tab === 'artifacts') await refreshArtifacts($)
+                }}
+              />
             )
           })}
         </Box>
-        <Box flexDirection="column" marginTop={1}>
-          {body}
-        </Box>
+        <Text color={C.line}>{'─'.repeat(width)}</Text>
+        {body}
       </Box>
     )
   })

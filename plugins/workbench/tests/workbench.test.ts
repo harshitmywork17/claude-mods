@@ -1,9 +1,13 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { Engine, MockClock } from 'claude-code/testing'
+import type { OutlineEntry } from '../types'
 
+import { innermostChanged } from '../hooks/changes'
+import { changedRanges, unifiedDiff } from '../hooks/diff'
 import { jsonTree, parseCsv, previewKind } from '../hooks/files'
-import { sideBySide } from '../hooks/sidebyside'
+import { diffstat } from '../hooks/theme'
+import { promptLabel } from '../hooks/trace'
 
 const ROOT = '/proj'
 const NOW = Date.parse('2026-10-05T10:00:00Z')
@@ -110,6 +114,7 @@ function engineBeneath(on: On, bandBelow = 'another mod band'): { clock: MockClo
   on('turn.complete', () => ({ text: '' }))
   on('ui.render', () => ({ type: 'Box', children: bandBelow === '' ? [] : [{ type: 'Text', children: [bandBelow] }] }))
   on('tool.call', async (_$, e) => {
+    if (e.tool === 'Bash' && e.command.includes('fastapi')) return { result: {} as never, text: 'ModuleNotFoundError: fastapi', isError: true }
     if (e.tool === 'Bash') {
       await clock.advance(12_000)
       if (e.command.includes('plot')) disk.set('latency.png', { text: 'PNG', mtimeMs: 5 })
@@ -155,11 +160,45 @@ async function workTurn($: Engine, clock: MockClock, spend: { usd: number }): Pr
 }
 
 describe('helpers', () => {
-  test('side-by-side pairs each removed line with the line that replaced it', () => {
-    const rows = sideBySide([TOOLS_HUNK])
-    expect(rows[0]).toEqual({ left: { line: 6, text: '    return session.run(sql)', kind: '-' }, right: { line: 6, text: '    return retry(lambda: session.run(sql))', kind: '+' } })
-    expect(rows.slice(1).every(row => row.left === undefined && row.right?.kind === '+')).toBe(true)
-    expect(sideBySide([TOOLS_HUNK, TOOLS_HUNK]).filter(row => row.isGap === true)).toHaveLength(1)
+  test('a whole-file diff keeps three lines of context and numbers each hunk', () => {
+    const diff = unifiedDiff(HEAD_TOOLS, NEW_TOOLS)
+    expect(diff.hunks).toBe(1)
+    expect(diff.text.split('\n')[0]).toBe('@@ -3,4 +3,8 @@')
+    expect(diff.text).toContain('\n     session = get_session()\n-    return session.run(sql)\n+    return retry(lambda: session.run(sql))')
+    expect(unifiedDiff(null, 'a\nb\n').text).toBe('@@ -0,0 +1,2 @@\n+a\n+b')
+    expect(unifiedDiff('same\n', 'same\n').text).toBe('')
+  })
+
+  test('an edit changes only its added and removed lines, not the context around them', () => {
+    const hunk = { oldStart: 5, oldLines: 3, newStart: 5, newLines: 4, lines: [' keep', '-old', '+new', '+more', ' keep'] }
+    expect(changedRanges([hunk])).toEqual([
+      [6, 6],
+      [6, 6],
+      [7, 7],
+    ])
+  })
+
+  test('a changed method names itself, not the whole class around it', () => {
+    const entries: OutlineEntry[] = [
+      { name: 'ChatService', kind: 'class', line: 1, endLine: 12, depth: 0, isChanged: true, calls: [] },
+      { name: 'reply', kind: 'method', line: 5, endLine: 7, depth: 1, isChanged: false, calls: [] },
+      { name: 'clear_history', kind: 'method', line: 9, endLine: 10, depth: 1, isChanged: true, calls: [] },
+    ]
+    expect(innermostChanged(entries).map(entry => entry.name)).toEqual(['clear_history'])
+  })
+
+  test('a background task notice reads as its summary', () => {
+    expect(promptLabel('<task-notification> <task-id>a1</task-id> <status>completed</status> <summary>Agent "Find callers" completed</summary></task-notification>')).toBe(
+      '↻ Agent "Find callers" completed',
+    )
+    expect(promptLabel('<task-notification><task-id>a1</task-id></task-notification>')).toBe('↻ a background task finished')
+    expect(promptLabel('  fix   the\nbug ')).toBe('fix the bug')
+  })
+
+  test('change bars scale to the largest file and split added from removed', () => {
+    expect(diffstat(10, 0, 10, 8)).toEqual({ plus: '▮▮▮▮▮▮▮▮', minus: '' })
+    expect(diffstat(3, 1, 8, 8)).toEqual({ plus: '▮▮▮', minus: '▮' })
+    expect(diffstat(0, 0, 8, 8)).toEqual({ plus: '', minus: '' })
   })
 
   test('file kinds, CSV and JSON', () => {
@@ -174,16 +213,32 @@ describe('helpers', () => {
   })
 })
 
-test('Now shows each tool call with status, timing and the subagent', async ($, on) => {
+test('the pane opens on one row of tabs, the open one drawn as a pill', async ($, on) => {
+  const { clock, spend } = engineBeneath(on)
+  await start($, clock)
+  await workTurn($, clock, spend)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: ' Now ' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: ' Changes 3 ' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: ' Artifacts 3 ' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '✓ idle · 1 turn' })).toBeDefined()
+  await ui.press({ key: 'tab:changes' })
+  expect(await ui.find({ type: 'Text', text: ' Changes 3 ' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: ' Now ' })).toBeDefined()
+})
+
+test('Now lists each call with status and timing, nests the subagent, and shows failures without asking', async ($, on) => {
   const { clock, spend } = engineBeneath(on)
   await start($, clock)
   await workTurn($, clock, spend)
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await ui.find({ type: 'Text', text: '✓ done' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: ' Bash 2 ' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: 'pytest -q' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: '12.0s' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /⑂ Explore · 7 tools · 12k tokens/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /↳ ok ⏎ 2 passed/ })).toBeUndefined()
     await ui.press({ key: 'now-outputs' })
     expect(await ui.find({ type: 'Text', text: /↳ ok ⏎ 2 passed/ })).toBeDefined()
     await ui.press({ key: 'now-outputs' })
@@ -191,28 +246,49 @@ test('Now shows each tool call with status, timing and the subagent', async ($, 
   }
 })
 
-test('Changes goes from turns to files to functions to a side-by-side diff, and replays', async ($, on) => {
+test('a failed call shows its error, and a background notice turn reads as its summary', async ($, on) => {
+  const { clock } = engineBeneath(on)
+  await start($, clock)
+  await $.turn.start({ turnId: 't9', text: '<task-notification><summary>Agent "Find callers" completed</summary></task-notification>' })
+  await $.tool.call({ tool: 'Bash', command: 'python -c "import fastapi"' })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 't9', usage: USAGE_TOKENS })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '“↻ Agent "Find callers" completed”' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '1 call · 1 failed' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '↳ ModuleNotFoundError: fastapi' })).toBeDefined()
+})
+
+test('Changes lists files with change bars, then a file with its functions and highlighted diff, then each edit', async ($, on) => {
   const { clock, spend } = engineBeneath(on)
   await start($, clock)
   await workTurn($, clock, spend)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'tab:changes' })
-  expect(await ui.find({ type: 'Text', text: '3 files' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '3 files changed' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: 'app/services/tools.py' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /ƒ execute_sql · retry$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /ƒ cached$/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /make SQL execution resilient/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'ƒ execute_sql, retry' })).toBeDefined()
 
-  await ui.press({ key: 'cfile:t1:0' })
+  await ui.press({ key: 'cfile:1' })
   expect(await ui.find({ type: 'Text', text: /modified · L4/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /added · L9/ })).toBeDefined()
+  const whole = await ui.find({ type: 'Code' })
+  expect(whole?.props).toMatchObject({ format: 'diff', path: 'app/services/tools.py' })
+  expect(String(whole?.props.source)).toContain('     session = get_session()\n-    return session.run(sql)')
 
   await ui.press({ key: 'fe:0' })
-  expect(await ui.find({ type: 'Text', text: /^ +before$/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^ {4}return session\.run\(sql\) +$/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^ {4}return retry\(lambda: session\.run\(sql\)\) +$/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /edit 1 of 3/ })).toBeDefined()
+  expect(String((await ui.find({ type: 'Code' }))?.props.source)).toBe(
+    '@@ -6,1 +6,5 @@\n-    return session.run(sql)\n+    return retry(lambda: session.run(sql))\n+\n+\n+def retry(action):\n+    return action()',
+  )
   await ui.press({ key: 'diff-next' })
   expect(await ui.find({ type: 'Text', text: /edit 2 of 3/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'app/services/cache.py' })).toBeDefined()
+  await ui.press({ key: 'diff-back' })
+  await ui.press({ key: 'file-back' })
+  await ui.press({ key: 'replay' })
+  expect(await ui.find({ type: 'Text', text: /edit 1 of 3/ })).toBeDefined()
 })
 
 test('Preview follows edits and renders Markdown, CSV, JSON and HTML', async ($, on) => {
@@ -224,7 +300,9 @@ test('Preview follows edits and renders Markdown, CSV, JSON and HTML', async ($,
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'tab:preview' })
   expect(await ui.find({ type: 'Text', text: 'report.md' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: ' MARKDOWN ' })).toBeDefined()
   expect((await ui.find({ type: 'Markdown' }))?.props).toMatchObject({ text: '# Latency report\n\nAll good.\n' })
+  expect(await ui.find({ type: 'Button', text: 'cache.py' })).toBeDefined()
 
   await run('preview data.csv')
   expect(await ui.find({ type: 'Text', text: /^agent, sql +$/ })).toBeDefined()
@@ -244,15 +322,15 @@ test('Preview follows edits and renders Markdown, CSV, JSON and HTML', async ($,
   expect(seen.copied).toEqual(['/proj/page.html'])
 })
 
-test('Artifacts lists what was created this session, by Claude or by commands', async ($, on) => {
+test('Artifacts groups what was created this session, by Claude or by commands', async ($, on) => {
   const { clock, spend, seen } = engineBeneath(on)
   await start($, clock)
   await workTurn($, clock, spend)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'tab:artifacts' })
   expect(await ui.find({ type: 'Text', text: '3 new files' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /📄 Documents/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /🖼 Images/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'DOCUMENTS' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'IMAGES' })).toBeDefined()
   expect(await ui.find({ type: 'Button', text: 'report.md' })).toBeDefined()
   expect(await ui.find({ type: 'Button', text: 'latency.png' })).toBeDefined()
   expect(await ui.find({ type: 'Button', text: 'li/lib/site.py' })).toBeUndefined()
@@ -260,7 +338,7 @@ test('Artifacts lists what was created this session, by Claude or by commands', 
   expect(seen.copied).toHaveLength(1)
 })
 
-test('Code Map draws the layers, marks edited folders and outlines a file', async ($, on) => {
+test('Code Map lists layers, marks edited folders, opens a folder and outlines a file', async ($, on) => {
   const { clock, spend } = engineBeneath(on)
   await start($, clock)
   await workTurn($, clock, spend)
@@ -268,10 +346,15 @@ test('Code Map draws the layers, marks edited folders and outlines a file', asyn
   await $.command.run({ command: 'wb', args: 'rescan', ...RUN })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /folder mode \(no git\)/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'L2' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '✎ 2' })).toBeDefined()
-  await $.command.run({ command: 'wb', args: 'components app/services/tools.py', ...RUN })
-  expect(await ui.findAll({ type: 'Text', text: '● changed' })).toHaveLength(2)
+  expect(await ui.find({ type: 'Text', text: 'LAYER 2 · entry points' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'LAYER 0 · foundations' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '✎2' })).toBeDefined()
+  await ui.press({ key: 'g:app/services' })
+  expect(await ui.find({ type: 'Text', text: /← used by app \(1\)/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: 'tools.py' })).toBeDefined()
+  await ui.press({ key: 'mf:app/services:2' })
+  expect(await ui.find({ type: 'Text', text: ' Components ' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '2 changed' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /→ get_session, retry/ })).toBeDefined()
 })
 
@@ -282,28 +365,30 @@ test('Usage shows limits with reset and pace, the context, and cost per turn', a
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'tab:usage' })
   expect(await ui.find({ type: 'Text', text: '75%' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /↻ resets in 2h · at \d\d:\d\d · on pace for 125% by the reset/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /⚠ at this pace you run out in 1h( \d+m)?, before the reset/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /↻ 2h · \d\d:\d\d/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /⚠ runs out in 1h( \d+m)? at this pace \(on pace for 125%\)/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: '$0.120' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /session total \$0\.62/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '$0.62 this session' })).toBeDefined()
 })
 
-test('the Workbench slide sums the session and shows the latest edit', async ($, on) => {
+test('the Workbench slide sums the session on one line and shows the latest edit', async ($, on) => {
   const { clock, spend } = engineBeneath(on)
   await start($, clock)
   await workTurn($, clock, spend)
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...HUD, surface })
     expect(await ui.find({ type: 'Text', text: 'Workbench' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: '5h' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: '↻2h' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /⏱ 1[23]m · 7 tools/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: '✎ 3 files +10 −1' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: '✦ 3 new' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: / · ✦ 3 new$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '5h ' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'last edit' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: 'report.md' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: 'another mod band' })).toBeUndefined()
     await ui.unmount()
   }
+  const narrow = await $.ui.mount({ ...HUD, surface: 'terminal', props: { ...HUD.props, bodyColumns: 90 } })
+  expect(await narrow.find({ type: 'Text', text: '5h ' })).toBeUndefined()
 })
 
 test('◀ moves to the Forecast slide: the forecast mod\'s band when it draws one', async ($, on) => {
@@ -312,10 +397,11 @@ test('◀ moves to the Forecast slide: the forecast mod\'s band when it draws on
   await workTurn($, clock, spend)
   const ui = await $.ui.mount({ ...HUD, surface: 'terminal' })
   await ui.press({ key: 'hud-left' })
+  expect(await ui.find({ type: 'Text', text: 'Forecast' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'another mod band' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '✦ 3 new' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: / · ✦ 3 new$/ })).toBeUndefined()
   await ui.press({ key: 'hud-right' })
-  expect(await ui.find({ type: 'Text', text: '✦ 3 new' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: / · ✦ 3 new$/ })).toBeDefined()
   await ui.press({ key: 'hud-hide' })
   expect(await ui.find({ type: 'Text', text: 'Workbench' })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: 'another mod band' })).toBeDefined()

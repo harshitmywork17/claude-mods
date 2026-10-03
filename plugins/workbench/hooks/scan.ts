@@ -57,6 +57,7 @@ export function countTexts(texts: ReadonlyMap<string, string>): string {
 }
 
 export const MAX_FILES = 4000
+const MAX_GROUP_PATHS = 60
 const MAX_GROUPS = 80
 const MAX_EDGES = 1000
 const GROUP_DEPTH = 3
@@ -272,6 +273,7 @@ export function buildScan(root: string, fileList: string, lineCounts: string, im
       lines: (groupFiles.get(id) ?? []).reduce((sum, file) => sum + (lines.get(file) ?? 0), 0),
       symbols: symbolCount.get(id) ?? 0,
       level: heights.get(id) ?? 0,
+      paths: [...(groupFiles.get(id) ?? [])].sort().slice(0, MAX_GROUP_PATHS),
     }))
     .sort((a, b) => b.level - a.level || a.id.localeCompare(b.id))
 

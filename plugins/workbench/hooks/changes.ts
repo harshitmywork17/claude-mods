@@ -1,5 +1,6 @@
 import type { OutlineEntry, SymbolChange, SymbolKind } from '../types'
 import { bodyOf } from './calls'
+import { diffOps } from './diff'
 import { isPython, symbolName } from './scan'
 
 export type Range = readonly [number, number]
@@ -41,62 +42,20 @@ export function parseDiff(diff: string): DiffFile[] {
   return files
 }
 
-/** The LCS table above which a diff gives up line matching and marks the whole middle as replaced. */
-const MAX_DIFF_CELLS = 4_000_000
-
 /**
  * Compares two versions of a file line by line, as `git diff -U0` would: changed ranges in the new
  * version, added and removed counts, and unified-diff text for the explanation prompt.
  */
 export function lineDiff(path: string, before: string | null, after: string | null): DiffFile & { text: string } {
   const split = (text: string): string[] => (text === '' ? [] : text.replace(/\n$/, '').split('\n'))
-  const a = split(before ?? '')
-  const b = split(after ?? '')
   const status = before === null ? 'added' : after === null ? 'deleted' : 'modified'
-
-  let head = 0
-  while (head < a.length && head < b.length && a[head] === b[head]) head += 1
-  let tail = 0
-  while (tail < a.length - head && tail < b.length - head && a[a.length - 1 - tail] === b[b.length - 1 - tail]) tail += 1
-  const midA = a.slice(head, a.length - tail)
-  const midB = b.slice(head, b.length - tail)
-
   type Op = { kind: ' ' | '-' | '+'; text: string }
-  const ops: Op[] = []
-  if ((midA.length + 1) * (midB.length + 1) > MAX_DIFF_CELLS) {
-    ops.push(...midA.map(text => ({ kind: '-' as const, text })), ...midB.map(text => ({ kind: '+' as const, text })))
-  } else {
-    const width = midB.length + 1
-    const table = new Uint32Array((midA.length + 1) * width)
-    for (let i = midA.length - 1; i >= 0; i -= 1) {
-      for (let j = midB.length - 1; j >= 0; j -= 1) {
-        table[i * width + j] =
-          midA[i] === midB[j]
-            ? (table[(i + 1) * width + j + 1] ?? 0) + 1
-            : Math.max(table[(i + 1) * width + j] ?? 0, table[i * width + j + 1] ?? 0)
-      }
-    }
-    let i = 0
-    let j = 0
-    while (i < midA.length || j < midB.length) {
-      if (i < midA.length && j < midB.length && midA[i] === midB[j]) {
-        ops.push({ kind: ' ', text: midA[i] ?? '' })
-        i += 1
-        j += 1
-      } else if (j >= midB.length || (i < midA.length && (table[(i + 1) * width + j] ?? 0) >= (table[i * width + j + 1] ?? 0))) {
-        ops.push({ kind: '-', text: midA[i] ?? '' })
-        i += 1
-      } else {
-        ops.push({ kind: '+', text: midB[j] ?? '' })
-        j += 1
-      }
-    }
-  }
+  const ops: Op[] = diffOps(split(before ?? ''), split(after ?? ''))
 
   const ranges: Range[] = []
   const text: string[] = [`--- a/${path}`, `+++ b/${path}`]
-  let oldLine = head + 1
-  let newLine = head + 1
+  let oldLine = 1
+  let newLine = 1
   let added = 0
   let removed = 0
   let index = 0
@@ -219,4 +178,10 @@ export function countCallers(grepOutput: string, definitions: ReadonlySet<string
 
 export function escapeRegex(name: string): string {
   return name.replace(/[$]/g, '\\$')
+}
+
+/** The changed entries, without a class whose change is already named by a changed member inside it. */
+export function innermostChanged(entries: readonly OutlineEntry[]): OutlineEntry[] {
+  const changed = entries.filter(entry => entry.isChanged)
+  return changed.filter(entry => !changed.some(other => other !== entry && other.depth > entry.depth && other.line >= entry.line && other.endLine <= entry.endLine))
 }
