@@ -202,6 +202,3 @@ myproject/
 ├── tests/
 │   └── test_accounts_user_creation.py
 ```
-```<!-- filepath: c:\Rakesh\Projects\coding guideline\Org-Standards\python\naming.md -->
-
-```

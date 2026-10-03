@@ -1,6 +1,6 @@
 {
   "name": "python-standards",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Python coding standards: SOLID/DRY/KISS/YAGNI, FastAPI layout, naming, OWASP-aligned secure coding, linting and testing setup.",
   "author": { "name": "harshitmywork17" },
   "license": "MIT"
