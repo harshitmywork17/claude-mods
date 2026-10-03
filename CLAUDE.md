@@ -19,6 +19,10 @@ Put anything he wants on all devices here as a plugin: mods (hooks modules), ski
 5. Commit to `main` and push. claude.ai reads the default branch.
 6. Tell Harshit what changed. A new plugin is off until he turns it on in claude.ai under **Customize → Plugins**. A changed plugin arrives with the next sync, after **Check for updates** there or a new session.
 
+## Expected sync warning
+
+A mod that uses `$.state` names its contract in `plugin.json` as `"types": "./types/index.d.ts"`. The claude.ai sync reports `unrecognized key in plugin.json: 'types'` and removes the key from the synced copy. This is expected. The engine does not read `types` at run time: it is only for `claude plugin validate` and the editor, and the tests pass with it removed. Keep the key, because `claude plugin validate` fails without it.
+
 ## What a plugin cannot carry
 
 Plugins do not sync `~/.claude/settings.json` (permissions, model, env), keybindings, or the status line command. Say so when one of these is asked for. Offer the closest plugin form instead, for example a mod for status line content or a settings hook for automation.
