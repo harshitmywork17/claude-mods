@@ -1,0 +1,7 @@
+{
+  "name": "mission-control",
+  "version": "0.1.0",
+  "description": "Live view of what Claude is executing: every tool call with its input, output and status, subagents in their own lanes, and a network-tab style timeline of durations. Observe-only.",
+  "author": { "name": "harshitmywork17" },
+  "types": "./types/index.d.ts"
+}

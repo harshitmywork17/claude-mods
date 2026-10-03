@@ -52,6 +52,21 @@
       "name": "python-standards",
       "source": "./plugins/python-standards",
       "description": "Python standards: SOLID/DRY/KISS, FastAPI layout, naming, secure coding, linting. /python-standards:python-standards"
+    },
+    {
+      "name": "fork-explorer",
+      "source": "./plugins/fork-explorer",
+      "description": "Ask \"what if...\" in a side pane; 2-3 alternatives side by side, never added to your conversation. /fork"
+    },
+    {
+      "name": "mission-control",
+      "source": "./plugins/mission-control",
+      "description": "Live view of tool calls, outputs, subagent lanes and a timing waterfall. Observe-only. /mission"
+    },
+    {
+      "name": "diff-minimap",
+      "source": "./plugins/diff-minimap",
+      "description": "Minimap strip beside each Edit and Write showing where in the file the change sits. Automatic."
     }
   ]
 }

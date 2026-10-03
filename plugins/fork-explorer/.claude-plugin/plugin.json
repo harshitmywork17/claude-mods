@@ -1,0 +1,7 @@
+{
+  "name": "fork-explorer",
+  "version": "0.1.0",
+  "description": "Ask \"what if...\" in a side pane: a side question over the current session returns 2-3 alternative approaches side by side, without adding anything to your conversation.",
+  "author": { "name": "harshitmywork17" },
+  "types": "./types/index.d.ts"
+}

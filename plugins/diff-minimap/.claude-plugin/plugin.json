@@ -1,0 +1,6 @@
+{
+  "name": "diff-minimap",
+  "version": "0.1.0",
+  "description": "A thin minimap strip beside each Edit and Write in the transcript: green, red and yellow ticks show where in the file the change sits, like VS Code's scrollbar.",
+  "author": { "name": "harshitmywork17" }
+}
