@@ -1,0 +1,7 @@
+{
+  "name": "karpathy-guidelines",
+  "version": "0.1.0",
+  "description": "Andrej Karpathy's guidelines against common LLM coding mistakes: think before coding, simplicity first, surgical changes, goal-driven execution. Skill: clean-code.",
+  "author": { "name": "harshitmywork17" },
+  "license": "MIT"
+}

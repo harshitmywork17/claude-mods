@@ -42,6 +42,16 @@
       "name": "sync-home",
       "source": "./plugins/sync-home",
       "description": "Tells Claude to put anything you want on all devices into this repository. Triggers when you ask for something synced everywhere."
+    },
+    {
+      "name": "karpathy-guidelines",
+      "source": "./plugins/karpathy-guidelines",
+      "description": "Karpathy's guidelines against common LLM coding mistakes. /karpathy-guidelines:clean-code"
+    },
+    {
+      "name": "python-standards",
+      "source": "./plugins/python-standards",
+      "description": "Python standards: SOLID/DRY/KISS, FastAPI layout, naming, secure coding, linting. /python-standards:python-standards"
     }
   ]
 }

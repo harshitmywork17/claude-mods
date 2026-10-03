@@ -1,6 +1,6 @@
 # harshit-mods
 
-A Claude Code plugin marketplace, and the single home for Claude customizations that stay the same on every device: five mods, the Claritymaxx skill, and the sync-home skill. To add something, ask Claude to put it "on all my devices". The sync-home skill and `CLAUDE.md` tell it how.
+A Claude Code plugin marketplace, and the single home for Claude customizations that stay the same on every device: five mods, the Claritymaxx skill, the sync-home skill, and the karpathy-guidelines and python-standards coding skills. To add something, ask Claude to put it "on all my devices". The sync-home skill and `CLAUDE.md` tell it how.
 
 | Plugin | Command | What it does |
 |---|---|---|
@@ -11,6 +11,8 @@ A Claude Code plugin marketplace, and the single home for Claude customizations 
 | session-meter | `/meter` | The status line shows elapsed time, tool calls and files edited. A toast appears when a turn takes 60 s or more; change it with `/plugin configure session-meter@harshit-mods`. |
 | claritymaxx | `/claritymaxx:explain <topic>`, or ask "explain..." | Third-party skill from [v60samurai/claritymaxx](https://github.com/v60samurai/claritymaxx). Builds a mental model first, then explains it as text, a diagram or a small HTML page. |
 | sync-home | (automatic) or ask "add X to all my devices" | A skill that tells Claude this repository is where plugins, mods, skills and other customizations go so they sync to every device. Claude adds them under `plugins/`, validates, pushes and tells you what to turn on. |
+| karpathy-guidelines | `/karpathy-guidelines:clean-code`, or automatic on any coding task | Guidelines from Andrej Karpathy's notes on LLM coding mistakes: think before coding, simplicity first, surgical changes, goal-driven execution, with worked examples in `EXAMPLES.md`. |
+| python-standards | `/python-standards:python-standards`, or automatic on Python work | Python standards: SOLID, DRY, KISS and YAGNI; FastAPI project layout; naming; OWASP-aligned secure coding; linting and testing setup. |
 
 ## Use them on every device
 
