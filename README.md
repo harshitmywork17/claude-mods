@@ -27,16 +27,37 @@ Add this marketplace to your claude.ai account once:
 2. Enter `harshitmywork17/claude-mods`. If the repository is private, your GitHub account must be connected to Claude.
 3. Turn on each plugin. Turn on `sync-home` too, so every session knows to put new synced customizations here.
 
-Plugins on your account sync to Claude Code v2.1.273 or later at session start, on every machine where you sign in with that account. Run `/reload-plugins` or start a new session to load them.
+Plugins on your account sync at session start, on every machine where you sign in to Claude Code with that account. Mods need Claude Code v2.1.287 or later (`claude --version`, then `claude update`). After you push a change here, press **Check for updates** on the marketplace in claude.ai, and turn on any new plugin. Then start a new session.
 
-Mods run in Claude Code only: the terminal, the desktop app's Code tab, IDE extensions and cloud sessions. Claude chat on the web, desktop and mobile shows no mod UI. Claritymaxx is a skill, so it also works in Claude chat and Cowork.
+If a command such as `/wb` is missing on a machine:
+
+1. `claude --version` must be 2.1.287 or later.
+2. `claude plugin list` should show `workbench@synced`. If it doesn't, the sync hasn't picked it up: check for updates in claude.ai, or install on that machine as below.
+3. `claude plugin test` run in an empty folder should say `no hooks module to load`. Any other message means mods are turned off there.
+
+Mods run in Claude Code only: the terminal, the desktop app's Code tab, IDE extensions and cloud sessions set up as below. Claude chat on the web, desktop and mobile shows no mod UI. Claritymaxx is a skill, so it also works in Claude chat and Cowork.
+
+## Use them in cloud sessions
+
+Cloud sessions at claude.ai/code don't load account plugins or the plugins a repository lists in `.claude/settings.json`. They do load plugin folders named in `CLAUDE_CODE_PLUGIN_DIRS`. Set it once on the cloud environment:
+
+1. Open the environment menu in a session's title bar, then **Edit**.
+2. Under **Environment variables**, add:
+   ```
+   CLAUDE_CODE_PLUGIN_DIRS=/home/user/claude-mods/plugins
+   ```
+3. When you start a cloud session, select `harshitmywork17/claude-mods` alongside the repository you're working on. It is cloned to `/home/user/claude-mods`, and every plugin in `plugins/` loads, including new ones.
+
+A cloud session can only clone the repositories selected for it, because this repository is private. In a session without it, the variable points at a missing folder, which Claude Code skips.
 
 ## Install on one machine
 
 ```bash
 claude plugin marketplace add harshitmywork17/claude-mods
-claude plugin install usage-forecast@harshit-mods   # repeat for each plugin
+claude plugin install workbench@harshit-mods   # repeat for each plugin
 ```
+
+Or run every plugin from a local clone, picking up changes with `git pull`: add `"env": { "CLAUDE_CODE_PLUGIN_DIRS": "<path to clone>/plugins" }` to `~/.claude/settings.json`. Don't combine this with account sync on the same machine: when two copies share a name, only the first one loads.
 
 ## Develop
 
