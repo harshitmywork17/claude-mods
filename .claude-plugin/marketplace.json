@@ -67,6 +67,11 @@
       "name": "diff-minimap",
       "source": "./plugins/diff-minimap",
       "description": "Minimap strip beside each Edit and Write showing where in the file the change sits. Automatic."
+    },
+    {
+      "name": "codebase-atlas",
+      "source": "./plugins/codebase-atlas",
+      "description": "Understand a codebase visually: live architecture map, changes by function with impact, component outlines, call graph, decision timeline and side-question explanations. /atlas"
     }
   ]
 }

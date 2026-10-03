@@ -1,0 +1,15 @@
+{
+  "name": "codebase-atlas",
+  "version": "0.1.0",
+  "description": "Understand a codebase visually: a live architecture map that lights up as Claude reads and edits, a call graph explorer, the session's changes by layer with their impact, a decision timeline, and side-question explanations that never enter your conversation. /atlas",
+  "author": { "name": "harshitmywork17" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "extractDecisions": {
+      "type": "boolean",
+      "title": "Extract decisions after each turn",
+      "description": "After a turn that edited files or gave a long answer, a small model call pulls out the decisions made, for the Decisions tab.",
+      "default": true
+    }
+  }
+}
