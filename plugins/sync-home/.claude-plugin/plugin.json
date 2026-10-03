@@ -1,0 +1,6 @@
+{
+  "name": "sync-home",
+  "version": "0.1.0",
+  "description": "Tells Claude that harshitmywork17/claude-mods is where plugins, mods, skills and other customizations go so they sync to every device.",
+  "author": { "name": "harshitmywork17" }
+}

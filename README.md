@@ -1,6 +1,6 @@
 # harshit-mods
 
-A Claude Code plugin marketplace with five mods and the Claritymaxx skill.
+A Claude Code plugin marketplace, and the single home for Claude customizations that stay the same on every device: five mods, the Claritymaxx skill, and the sync-home skill. To add something, ask Claude to put it "on all my devices". The sync-home skill and `CLAUDE.md` tell it how.
 
 | Plugin | Command | What it does |
 |---|---|---|
@@ -10,6 +10,7 @@ A Claude Code plugin marketplace with five mods and the Claritymaxx skill.
 | changed-files | `/changed-files` | A live sidebar of every file touched this session, with +/- counts, edit counts and a `new` tag. It opens by itself on the first edit. |
 | session-meter | `/meter` | The status line shows elapsed time, tool calls and files edited. A toast appears when a turn takes 60 s or more; change it with `/plugin configure session-meter@harshit-mods`. |
 | claritymaxx | `/claritymaxx:explain <topic>`, or ask "explain..." | Third-party skill from [v60samurai/claritymaxx](https://github.com/v60samurai/claritymaxx). Builds a mental model first, then explains it as text, a diagram or a small HTML page. |
+| sync-home | (automatic) or ask "add X to all my devices" | A skill that tells Claude this repository is where plugins, mods, skills and other customizations go so they sync to every device. Claude adds them under `plugins/`, validates, pushes and tells you what to turn on. |
 
 ## Use them on every device
 
@@ -17,7 +18,7 @@ Add this marketplace to your claude.ai account once:
 
 1. On claude.ai, open **Customize**, then **Plugins**, then **Add**, then **Add marketplace**.
 2. Enter `harshitmywork17/claude-mods`. If the repository is private, your GitHub account must be connected to Claude.
-3. Turn on each plugin.
+3. Turn on each plugin. Turn on `sync-home` too, so every session knows to put new synced customizations here.
 
 Plugins on your account sync to Claude Code v2.1.273 or later at session start, on every machine where you sign in with that account. Run `/reload-plugins` or start a new session to load them.
 

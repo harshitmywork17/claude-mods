@@ -1,7 +1,9 @@
 {
   "name": "harshit-mods",
   "description": "Harshit's Claude Code mods, plus the Claritymaxx explain skill.",
-  "owner": { "name": "harshitmywork17" },
+  "owner": {
+    "name": "harshitmywork17"
+  },
   "plugins": [
     {
       "name": "token-weather",
@@ -30,8 +32,16 @@
     },
     {
       "name": "claritymaxx",
-      "source": { "source": "github", "repo": "v60samurai/claritymaxx" },
+      "source": {
+        "source": "github",
+        "repo": "v60samurai/claritymaxx"
+      },
       "description": "Turns difficult topics into clear mental models: text, a diagram or a small HTML page. /claritymaxx:explain"
+    },
+    {
+      "name": "sync-home",
+      "source": "./plugins/sync-home",
+      "description": "Tells Claude to put anything you want on all devices into this repository. Triggers when you ask for something synced everywhere."
     }
   ]
 }
