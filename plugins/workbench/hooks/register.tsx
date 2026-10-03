@@ -41,12 +41,14 @@ import {
 } from './scan'
 import type { Scan } from './scan'
 import { fit, sideBySide } from './sidebyside'
+import { C, hasContent, hue, pill } from './theme'
 import { BADGE, MAX_TURNS, bar, colorOf, modelTime, onNewest, preview, relabel, seconds, statusOf, summarize, withStep, withStepChange } from './trace'
 
 // ── State ───────────────────────────────────────────────────────────────
 
 const tabAtom = atom({ plugin: 'workbench', key: 'tab' } as const, 'now')
 const hudHiddenAtom = atom({ plugin: 'workbench', key: 'isHudHidden' } as const, false)
+const slideAtom = atom({ plugin: 'workbench', key: 'slide' } as const, 'workbench')
 const startedAtAtom = atom({ plugin: 'workbench', key: 'startedAt' } as const, 0)
 const turnsAtom = atom({ plugin: 'workbench', key: 'turns' } as const, [])
 const turnBackAtom = atom({ plugin: 'workbench', key: 'turnBack' } as const, 0)
@@ -525,17 +527,16 @@ function toLimits(windows: readonly SessionRateLimit[]): Limit[] {
 
 type T = Pick<Elements['terminal'], 'Box' | 'Text' | 'Button' | 'Markdown' | 'Code'>
 
-const TABS: { tab: Tab; label: string; key: string }[] = [
-  { tab: 'now', label: 'Now', key: '1' },
-  { tab: 'changes', label: 'Changes', key: '2' },
-  { tab: 'preview', label: 'Preview', key: '3' },
-  { tab: 'artifacts', label: 'Artifacts', key: '4' },
-  { tab: 'map', label: 'Code Map', key: '5' },
-  { tab: 'usage', label: 'Usage', key: '6' },
+const TABS: { tab: Tab; label: string; key: string; icon: string }[] = [
+  { tab: 'now', label: 'Now', key: '1', icon: '●' },
+  { tab: 'changes', label: 'Changes', key: '2', icon: '±' },
+  { tab: 'preview', label: 'Preview', key: '3', icon: '◉' },
+  { tab: 'artifacts', label: 'Artifacts', key: '4', icon: '✦' },
+  { tab: 'map', label: 'Code Map', key: '5', icon: '◇' },
+  { tab: 'usage', label: 'Usage', key: '6', icon: '◔' },
 ]
 
-const C = { ok: 'green', bad: 'red', warn: 'yellow', live: 'cyan', accent: 'magenta' } as const
-const CHANGE_MARK = { added: ['+', 'green'], modified: ['~', 'yellow'], removed: ['−', 'red'] } as const
+const CHANGE_MARK = { added: ['+', C.ok], modified: ['~', C.warn], removed: ['−', C.bad] } as const
 const KIND_ICON_CODE = { class: '◆', function: 'ƒ', method: '·' } as const
 
 function heading(t: T, title: string, detail?: string): RenderNode {
@@ -587,13 +588,13 @@ function nowView($: EngineInterface, t: T, turns: readonly Turn[], back: number,
         const steps = turn.steps.filter(step => step.lane === lane.id)
         if (steps.length === 0 && lane.id !== 'main') return null
         return (
-          <Box key={`lane-${lane.id}`} flexDirection="column" marginTop={1}>
-            <Text bold color={lane.id === 'main' ? undefined : C.accent} wrap="truncate-end">
+          <Box key={`lane-${lane.id}`} flexDirection="column" marginTop={1} borderStyle="round" borderColor={lane.id === 'main' ? C.line : C.accent} paddingX={1}>
+            <Text bold color={lane.id === 'main' ? C.live : C.accent} wrap="truncate-end">
               {lane.id === 'main' ? '▌Main' : `▌⑂ ${lane.label}`}
             </Text>
             {steps.length === 0 && <Text dimColor> no tool calls yet</Text>}
             {steps.map(step => {
-              const color = colorOf(step, now)
+              const color = hue(colorOf(step, now))
               const { pad, fill } = bar(step, turn, now, barWidth)
               return (
                 <Box key={`step-${step.id}`} flexDirection="column">
@@ -696,7 +697,7 @@ function diffView($: EngineInterface, t: T, edits: readonly EditRecord[], edit: 
             {'      before'}
           </Text>
         </Box>
-        <Text color="gray">│</Text>
+        <Text color={C.line}>│</Text>
         <Box width={half} flexShrink={0}>
           <Text bold color={C.ok}>
             {'      after'}
@@ -711,7 +712,7 @@ function diffView($: EngineInterface, t: T, edits: readonly EditRecord[], edit: 
         ) : (
           <Box key={`row-${rowIndex}`} flexDirection="row">
             {cell('left', row.left)}
-            <Text color="gray">│</Text>
+            <Text color={C.line}>│</Text>
             {cell('right', row.right)}
           </Box>
         ),
@@ -806,7 +807,7 @@ function changesOverview($: EngineInterface, t: T, edits: readonly EditRecord[],
         const byFile = [...new Set(inTurn.map(edit => edit.file))]
         const prompt = turns.find(turn => turn.id === turnId)?.prompt ?? 'earlier'
         return (
-          <Box key={`ct-${turnId}`} flexDirection="column" marginTop={1}>
+          <Box key={`ct-${turnId}`} flexDirection="column" marginTop={1} borderStyle="round" borderColor={C.line} paddingX={1}>
             {heading(t, `“${prompt.length > 70 ? `${prompt.slice(0, 70)}…` : prompt}”`, `${inTurn.length} edit${inTurn.length === 1 ? '' : 's'}`)}
             {byFile.map((file, index) => {
               const fileEdits = inTurn.filter(edit => edit.file === file)
@@ -890,7 +891,7 @@ function previewBody(t: T, table: Record<string, unknown>, surface: string, prev
         </Box>
       )
     }
-    const color = { object: C.accent, array: C.accent, string: C.ok, number: C.warn, boolean: C.live, null: 'gray' } as const
+    const color = { object: C.accent, array: C.accent, string: C.ok, number: C.warn, boolean: C.live, null: C.line } as const
     return (
       <Box flexDirection="column">
         {lines.map((line, index) => (
@@ -992,7 +993,7 @@ function artifactsView($: EngineInterface, t: T, artifacts: readonly Artifact[],
               const index = artifacts.indexOf(one)
               return (
                 <Box key={`art-${index}`} flexDirection="row" gap={1}>
-                  <Text color={one.isByClaude ? C.accent : 'gray'}>{one.isByClaude ? ' ✦' : '  '}</Text>
+                  <Text color={one.isByClaude ? C.accent : C.line}>{one.isByClaude ? ' ✦' : '  '}</Text>
                   <Button key={`art:${index}`} label={one.path} plain onPress={() => openPreview($, one.path)} />
                   <Text dimColor>
                     {bytes(one.size)} · {ago(now - one.mtimeMs)}
@@ -1044,7 +1045,7 @@ function mapGraphView($: EngineInterface, t: T, graph: Graph, edits: readonly Ed
               .map(group => {
                 const count = edited.get(group.id)
                 return (
-                  <Box key={`grp-${group.id}`} flexDirection="column" borderStyle={group.id === focus ? 'double' : 'round'} borderColor={count === undefined ? 'gray' : C.warn} paddingX={1}>
+                  <Box key={`grp-${group.id}`} flexDirection="column" borderStyle={group.id === focus ? 'double' : 'round'} borderColor={count === undefined ? C.line : C.warn} paddingX={1}>
                     <Button key={`g:${group.id}`} label={group.id} plain onPress={() => update($, mapFocusAtom, now => (now === group.id ? null : group.id))} />
                     <Text dimColor>
                       {group.files} files · {shortCount(group.lines)} lines
@@ -1100,7 +1101,7 @@ function componentsView($: EngineInterface, t: T, outline: Outline | null, colum
               <Text dimColor>
                 L{entry.line}-{entry.endLine}
               </Text>
-              <Text color={entry.isChanged ? C.warn : 'gray'}>{'▇'.repeat(Math.max(1, Math.round((size / longest) * barWidth)))}</Text>
+              <Text color={entry.isChanged ? C.warn : C.line}>{'▇'.repeat(Math.max(1, Math.round((size / longest) * barWidth)))}</Text>
               {entry.isChanged && <Text color={C.warn}>● changed</Text>}
             </Box>
             {entry.calls.length > 0 && (
@@ -1195,16 +1196,16 @@ function usageView(t: T, limits: readonly Limit[], reading: Reading | null, hist
         const elapsed = Number.isNaN(reset) || windowMs === 0 ? 0 : now - (reset - windowMs)
         const projected = elapsed > 5 * 60_000 ? Math.round((limit.percentUsed / elapsed) * windowMs) : undefined
         return (
-          <Box key={`ul-${limit.kind}`} flexDirection="column" marginTop={1}>
+          <Box key={`ul-${limit.kind}`} flexDirection="column" marginTop={1} borderStyle="round" borderColor={hue(view.color)} paddingX={1}>
             <Box flexDirection="row" gap={1}>
               <Box width={8} flexShrink={0}>
                 <Text bold>{view.label}</Text>
               </Box>
               <Text>
-                <Text color={view.color}>{filled.used}</Text>
+                <Text color={hue(view.color)}>{filled.used}</Text>
                 <Text dimColor>{filled.left}</Text>
               </Text>
-              <Text bold color={view.color}>
+              <Text bold color={hue(view.color)}>
                 {Math.round(view.percent)}%
               </Text>
             </Box>
@@ -1226,7 +1227,7 @@ function usageView(t: T, limits: readonly Limit[], reading: Reading | null, hist
         <Text dimColor> No reading yet.</Text>
       ) : (
         <Box flexDirection="row" gap={1}>
-          <Text color={sky(reading.percent).color} bold>
+          <Text color={hue(sky(reading.percent).color)} bold>
             {' '}
             {sky(reading.percent).icon} {sky(reading.percent).label}
           </Text>
@@ -1274,6 +1275,10 @@ async function openTab($: EngineInterface, args: string): Promise<void> {
   else if (word === 'calls' && value !== '') await loadCalls($, value)
   else if (word === 'components' && value !== '') await loadOutline($, value)
   else if (word === 'hud') await update($, hudHiddenAtom, () => value === 'off')
+  else if (word === 'forecast' || word === 'workbench') {
+    await update($, slideAtom, () => word)
+    await update($, hudHiddenAtom, () => false)
+  }
   else if (word === 'rescan') {
     await update($, tabAtom, (): Tab => 'map')
     await scan($)
@@ -1442,18 +1447,120 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    // Other mods draw in this band too: draw theirs first and stack the HUD above it, never in its place.
+    // Other mods draw in this band too. The Forecast slide shows theirs when there is one, so ◀ moves to it.
     const below = await next(e)
     if (e.props.hasSurvey || (await read($, hudHiddenAtom))) return below
     const { Box, Button, Text } = $.ui.resolve(e)
     const now = await $.clock.now()
     const limits = await read($, limitsAtom)
     const reading = await read($, readingAtom)
+    const history = await read($, historyAtom)
     const turns = await read($, turnsAtom)
     const edits = await read($, editsAtom)
     const artifacts = await read($, artifactsAtom)
     const startedAt = await read($, startedAtAtom)
-    if (limits.length === 0 && reading === null && turns.length === 0) return below
+    const slide = await read($, slideAtom)
+    const isBelowDrawn = hasContent(below)
+    if (limits.length === 0 && reading === null && turns.length === 0 && !isBelowDrawn) return below
+
+    const wide = e.props.bodyColumns >= 120
+    const dot = (isOn: boolean): RenderNode => <Text color={isOn ? C.accent : C.line}>{isOn ? '●' : '○'}</Text>
+    const name = (label: string, isOn: boolean): RenderNode => (
+      <Text bold={isOn} color={isOn ? C.accent : C.soft}>
+        {label}
+      </Text>
+    )
+
+    const nav = (
+      <Box flexDirection="row" gap={1}>
+        <Button key="hud-left" label="◀" plain dimColor={slide === 'forecast'} onPress={() => update($, slideAtom, () => 'forecast')} />
+        {dot(slide === 'forecast')}
+        {name('Forecast', slide === 'forecast')}
+        <Text color={C.line}> </Text>
+        {dot(slide === 'workbench')}
+        {name('Workbench', slide === 'workbench')}
+        <Button key="hud-right" label="▶" plain dimColor={slide === 'workbench'} onPress={() => update($, slideAtom, () => 'workbench')} />
+        <Text color={C.line}>│</Text>
+        <Button
+          key="hud-open"
+          label="open ▸"
+          plain
+          onPress={async () => {
+            const running = (await read($, turnsAtom)).at(-1)?.steps.some(step => step.status === 'running') ?? false
+            const target: Tab = slide === 'forecast' ? 'usage' : running ? 'now' : (await read($, editsAtom)).length > 0 ? 'changes' : 'now'
+            await update($, tabAtom, () => target)
+            await $.ui.open({ id: PANE, title: TITLE })
+          }}
+        />
+        <Button key="hud-hide" label="hide" plain dimColor onPress={() => update($, hudHiddenAtom, () => true)} />
+      </Box>
+    )
+
+    if (slide === 'forecast') {
+      if (isBelowDrawn) {
+        return (
+          <Box flexDirection="column">
+            {nav}
+            {below}
+          </Box>
+        )
+      }
+      const barWidth = wide ? 18 : 10
+      return (
+        <Box flexDirection="column">
+          {nav}
+          {limits.length === 0 && reading === null && <Text color={C.soft}> No plan or context reading yet: it appears after the first reply.</Text>}
+          {limits.map(limit => {
+            const view = viewOf(limit, now)
+            const gauge = meter(view.percent, barWidth)
+            return (
+              <Box key={`fc-${limit.kind}`} flexDirection="row" gap={1}>
+                <Box width={8} flexShrink={0}>
+                  <Text bold>{view.label}</Text>
+                </Box>
+                <Text>
+                  <Text color={hue(view.color)}>{gauge.used}</Text>
+                  <Text color={C.line}>{gauge.left}</Text>
+                </Text>
+                <Box width={5} flexShrink={0} justifyContent="flex-end">
+                  <Text bold color={hue(view.color)}>
+                    {Math.round(view.percent)}%
+                  </Text>
+                </Box>
+                {view.resetIn !== undefined && (
+                  <Text color={C.soft} wrap="truncate-end">
+                    ↻ resets in {view.resetIn} · {view.resetAt}
+                  </Text>
+                )}
+                {view.runsOutIn !== undefined && (
+                  <Text color={view.percent >= 70 ? C.bad : C.warn} wrap="truncate-end">
+                    ⚠ at this pace, out in {view.runsOutIn}
+                  </Text>
+                )}
+              </Box>
+            )
+          })}
+          {reading !== null && (
+            <Box flexDirection="row" gap={1}>
+              <Box width={8} flexShrink={0}>
+                <Text bold>Context</Text>
+              </Box>
+              <Text bold color={hue(sky(reading.percent).color)}>
+                {sky(reading.percent).icon} {sky(reading.percent).label}
+              </Text>
+              <Text>
+                {reading.percent}% <Text color={C.soft}>({kilo(reading.tokens)}/{kilo(reading.window)})</Text>
+              </Text>
+              <Text color={C.live}>{sparkline(history)}</Text>
+              <Text color={C.soft} wrap="truncate-end">
+                {outlook(history, reading)}
+                {sky(reading.percent).advice === undefined ? '' : ` · ${sky(reading.percent).advice}`}
+              </Text>
+            </Box>
+          )}
+        </Box>
+      )
+    }
 
     const tools = turns.reduce((sum, turn) => sum + turn.steps.length, 0)
     const files = new Set(edits.map(edit => edit.file)).size
@@ -1463,81 +1570,90 @@ export const register: Register = on => {
     const last = edits.at(-1)
     const firstMinus = last?.hunks.flatMap(hunk => hunk.lines).find(line => line.startsWith('-'))
     const firstPlus = last?.hunks.flatMap(hunk => hunk.lines).find(line => line.startsWith('+'))
-    const sep = <Text color="gray">│</Text>
+    const dotSep = <Text color={C.line}>·</Text>
 
     return (
       <Box flexDirection="column">
-        <Box flexDirection="row" gap={1} flexWrap="wrap">
+        {nav}
+        <Box flexDirection="row" columnGap={1} flexWrap="wrap">
           {limits.slice(0, 2).map(limit => {
             const view = viewOf(limit, now)
-            const gauge = meter(view.percent, 8)
+            const gauge = pill(view.percent, wide ? 8 : 5)
             return (
               <Box key={`hud-${limit.kind}`} flexDirection="row" gap={1}>
-                <Text bold>{limit.kind === 'five_hour' ? '5h' : limit.kind === 'seven_day' ? 'Wk' : view.label}</Text>
+                <Text color={C.soft}>{limit.kind === 'five_hour' ? '5h' : limit.kind === 'seven_day' ? 'Wk' : view.label}</Text>
                 <Text>
-                  <Text color={view.color}>{gauge.used}</Text>
-                  <Text dimColor>{gauge.left}</Text>
+                  <Text color={hue(view.color)}>{gauge.used}</Text>
+                  <Text color={C.line}>{gauge.left}</Text>
                 </Text>
-                <Text color={view.color}>{Math.round(view.percent)}%</Text>
-                {view.resetIn !== undefined && <Text dimColor>↻{view.resetIn}</Text>}
+                <Text bold color={hue(view.color)}>
+                  {Math.round(view.percent)}%
+                </Text>
+                {view.resetIn !== undefined && <Text color={C.soft}>↻{view.resetIn}</Text>}
                 {view.runsOutIn !== undefined && <Text color={C.bad}>⚠</Text>}
-                {sep}
+                {dotSep}
               </Box>
             )
           })}
           {reading !== null && (
             <Text>
-              <Text bold>Ctx </Text>
-              <Text color={sky(reading.percent).color}>
+              <Text color={C.soft}>Ctx </Text>
+              <Text bold color={hue(sky(reading.percent).color)}>
                 {sky(reading.percent).icon} {reading.percent}%
               </Text>
             </Text>
           )}
-          {reading !== null && sep}
-          <Text dimColor>
-            ⏱ {startedAt > 0 ? duration(now - startedAt) : '–'} · {tools} tools
-          </Text>
-          {sep}
+          {reading !== null && dotSep}
           <Text>
-            ✎ {files} file{files === 1 ? '' : 's'} <Text color={C.ok}>+{added}</Text> <Text color={C.bad}>−{removed}</Text>
+            <Text color={C.soft}>⏱ </Text>
+            <Text bold>{startedAt > 0 ? duration(now - startedAt) : '–'}</Text>
+            <Text color={C.soft}> · </Text>
+            <Text bold>{tools}</Text>
+            <Text color={C.soft}> tools</Text>
           </Text>
-          {artifacts.length > 0 && sep}
-          {artifacts.length > 0 && <Text color={C.accent}>✦ {artifacts.length} new</Text>}
-        </Box>
-        <Box flexDirection="row" gap={1}>
-          {running !== undefined ? (
-            <Text color={C.live} wrap="truncate-end">
-              ● {running.tool} {running.summary} · {seconds(now - running.startedAt)}
+          {dotSep}
+          <Text>
+            <Text color={C.warn}>✎ </Text>
+            <Text bold>{files}</Text>
+            <Text color={C.soft}> file{files === 1 ? '' : 's'} </Text>
+            <Text color={C.ok}>+{added}</Text> <Text color={C.bad}>−{removed}</Text>
+          </Text>
+          {artifacts.length > 0 && dotSep}
+          {artifacts.length > 0 && (
+            <Text>
+              <Text color={C.accent}>✦ </Text>
+              <Text bold>{artifacts.length}</Text>
+              <Text color={C.soft}> new</Text>
             </Text>
-          ) : last !== undefined ? (
-            <Box flexDirection="row" gap={1} flexShrink={1}>
-              <Text color={C.warn}>✎ {last.file.split('/').pop()}</Text>
-              {firstMinus !== undefined && (
-                <Text color={C.bad} wrap="truncate-end">
-                  {firstMinus.trim().slice(0, 60)}
-                </Text>
-              )}
-              {firstPlus !== undefined && (
-                <Text color={C.ok} wrap="truncate-end">
-                  {firstPlus.trim().slice(0, 60)}
-                </Text>
-              )}
-            </Box>
-          ) : (
-            <Text dimColor>Workbench · /wb opens the pane</Text>
           )}
-          <Button
-            key="hud-open"
-            label="open ▸"
-            plain
-            onPress={async () => {
-              await update($, tabAtom, (): Tab => (running !== undefined ? 'now' : last !== undefined ? 'changes' : 'now'))
-              await $.ui.open({ id: PANE, title: TITLE })
-            }}
-          />
-          <Button key="hud-hide" label="hide" plain dimColor onPress={() => update($, hudHiddenAtom, () => true)} />
         </Box>
-        {below}
+        {running !== undefined ? (
+          <Box flexDirection="row" gap={1}>
+            <Text color={C.live}>●</Text>
+            <Text bold color={C.live}>
+              {running.tool}
+            </Text>
+            <Text color={C.soft} wrap="truncate-end">
+              {running.summary}
+            </Text>
+            <Text color={C.live}>{seconds(now - running.startedAt)}</Text>
+          </Box>
+        ) : last !== undefined ? (
+          <Box flexDirection="row" gap={1}>
+            <Text color={C.warn}>✎</Text>
+            <Text bold>{last.file.split('/').pop()}</Text>
+            {firstMinus !== undefined && (
+              <Text color={C.bad} wrap="truncate-end">
+                {firstMinus.trim().slice(0, 60)}
+              </Text>
+            )}
+            {firstPlus !== undefined && (
+              <Text color={C.ok} wrap="truncate-end">
+                {firstPlus.trim().slice(0, 60)}
+              </Text>
+            )}
+          </Box>
+        ) : null}
       </Box>
     )
   })
@@ -1606,22 +1722,37 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        <Box flexDirection="row" flexWrap="wrap" gap={1}>
-          {TABS.map(one => (
-            <Button
-              key={`tab:${one.tab}`}
-              label={one.label}
-              hotkey={one.key}
-              variant={one.tab === tab ? 'primary' : 'secondary'}
-              onPress={async () => {
-                await update($, tabAtom, () => one.tab)
-                if (one.tab === 'artifacts') await refreshArtifacts($)
-              }}
-            />
-          ))}
+        <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+          <Box flexDirection="column">
+            <Text bold color={C.accent}>
+              ◆ Workbench
+            </Text>
+            <Text color={C.line}>{'─'.repeat(11)}</Text>
+          </Box>
+          {TABS.map(one => {
+            const isActive = one.tab === tab
+            const label = `${one.icon} ${one.label}`
+            return (
+              <Box key={`tabbox-${one.tab}`} flexDirection="column">
+                <Button
+                  key={`tab:${one.tab}`}
+                  label={label}
+                  hotkey={one.key}
+                  plain
+                  dimColor={!isActive}
+                  onPress={async () => {
+                    await update($, tabAtom, () => one.tab)
+                    if (one.tab === 'artifacts') await refreshArtifacts($)
+                  }}
+                />
+                <Text color={isActive ? C.accent : C.line}>{(isActive ? '━' : '─').repeat(label.length + 3)}</Text>
+              </Box>
+            )
+          })}
         </Box>
-        <Text color="gray">{'─'.repeat(Math.max(10, columns - 1))}</Text>
-        <Box flexDirection="column">{body}</Box>
+        <Box flexDirection="column" marginTop={1}>
+          {body}
+        </Box>
       </Box>
     )
   })

@@ -63,7 +63,7 @@ function listing(disk: Disk, dir: string) {
   return [...entries.values()]
 }
 
-function engineBeneath(on: On): { clock: MockClock; disk: Disk; seen: Seen; spend: { usd: number } } {
+function engineBeneath(on: On, bandBelow = 'another mod band'): { clock: MockClock; disk: Disk; seen: Seen; spend: { usd: number } } {
   const disk: Disk = new Map(Object.entries(START_FILES).map(([path, text]) => [path, { text, mtimeMs: 1 }]))
   const seen: Seen = { copied: [], screenshots: [], reads: [] }
   const spend = { usd: 0.5 }
@@ -108,7 +108,7 @@ function engineBeneath(on: On): { clock: MockClock; disk: Disk; seen: Seen; spen
   on('agent.list', () => ({ value: [] }))
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
-  on('ui.render', () => ({ type: 'Box', children: [{ type: 'Text', children: ['another mod band'] }] }))
+  on('ui.render', () => ({ type: 'Box', children: bandBelow === '' ? [] : [{ type: 'Text', children: [bandBelow] }] }))
   on('tool.call', async (_$, e) => {
     if (e.tool === 'Bash') {
       await clock.advance(12_000)
@@ -288,33 +288,52 @@ test('Usage shows limits with reset and pace, the context, and cost per turn', a
   expect(await ui.find({ type: 'Text', text: /session total \$0\.62/ })).toBeDefined()
 })
 
-test('the HUD sums the session and shows the latest edit', async ($, on) => {
+test('the Workbench slide sums the session and shows the latest edit', async ($, on) => {
   const { clock, spend } = engineBeneath(on)
   await start($, clock)
   await workTurn($, clock, spend)
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...HUD, surface })
+    expect(await ui.find({ type: 'Text', text: 'Workbench' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: '5h' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: '↻2h' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /⏱ 1[23]m · 7 tools/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /✎ 3 files/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '✎ 3 files +10 −1' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: '✦ 3 new' })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: '✎ report.md' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'report.md' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'another mod band' })).toBeUndefined()
     await ui.unmount()
   }
-  const ui = await $.ui.mount({ ...HUD, surface: 'terminal' })
-  await ui.press({ key: 'hud-hide' })
-  expect(await ui.find({ type: 'Text', text: '5h' })).toBeUndefined()
 })
 
-test('the HUD stacks above another mod\'s band instead of replacing it', async ($, on) => {
+test('◀ moves to the Forecast slide: the forecast mod\'s band when it draws one', async ($, on) => {
   const { clock, spend } = engineBeneath(on)
   await start($, clock)
   await workTurn($, clock, spend)
   const ui = await $.ui.mount({ ...HUD, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: '5h' })).toBeDefined()
+  await ui.press({ key: 'hud-left' })
   expect(await ui.find({ type: 'Text', text: 'another mod band' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '✦ 3 new' })).toBeUndefined()
+  await ui.press({ key: 'hud-right' })
+  expect(await ui.find({ type: 'Text', text: '✦ 3 new' })).toBeDefined()
   await ui.press({ key: 'hud-hide' })
-  expect(await ui.find({ type: 'Text', text: '5h' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'Workbench' })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: 'another mod band' })).toBeDefined()
+})
+
+test('◀ draws its own Forecast slide when no forecast mod is on', async ($, on) => {
+  const { clock, spend } = engineBeneath(on, '')
+  await start($, clock)
+  await workTurn($, clock, spend)
+  await $.command.run({ command: 'wb', args: 'forecast', ...RUN })
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...HUD, surface })
+    expect(await ui.find({ type: 'Text', text: '5-hour' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Weekly' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '75%' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /↻ resets in 2h · \d\d:\d\d/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /⚠ at this pace, out in 1h/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Context' })).toBeDefined()
+    await ui.unmount()
+  }
 })

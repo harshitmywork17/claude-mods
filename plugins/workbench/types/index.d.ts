@@ -125,11 +125,15 @@ export type Limit = { kind: string; percentUsed: number; resetsAt?: string }
 
 export type Tab = 'now' | 'changes' | 'preview' | 'artifacts' | 'map' | 'usage'
 
+/** Which slide the band above the prompt shows: ◀ Forecast, ▶ Workbench. */
+export type Slide = 'forecast' | 'workbench'
+
 declare module 'claude-code' {
   interface PluginState {
     workbench: {
       tab: Tab
       isHudHidden: boolean
+      slide: Slide
       startedAt: number
       turns: Turn[]
       turnBack: number
