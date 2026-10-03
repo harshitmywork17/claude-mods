@@ -1,6 +1,6 @@
 {
   "name": "codebase-atlas",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Understand a codebase visually: a live architecture map that lights up as Claude reads and edits, a call graph explorer, the session's changes by layer with their impact, a decision timeline, and side-question explanations that never enter your conversation. /atlas",
   "author": { "name": "harshitmywork17" },
   "types": "./types/index.d.ts",

@@ -41,6 +41,89 @@ export function parseDiff(diff: string): DiffFile[] {
   return files
 }
 
+/** The LCS table above which a diff gives up line matching and marks the whole middle as replaced. */
+const MAX_DIFF_CELLS = 4_000_000
+
+/**
+ * Compares two versions of a file line by line, as `git diff -U0` would: changed ranges in the new
+ * version, added and removed counts, and unified-diff text for the explanation prompt.
+ */
+export function lineDiff(path: string, before: string | null, after: string | null): DiffFile & { text: string } {
+  const split = (text: string): string[] => (text === '' ? [] : text.replace(/\n$/, '').split('\n'))
+  const a = split(before ?? '')
+  const b = split(after ?? '')
+  const status = before === null ? 'added' : after === null ? 'deleted' : 'modified'
+
+  let head = 0
+  while (head < a.length && head < b.length && a[head] === b[head]) head += 1
+  let tail = 0
+  while (tail < a.length - head && tail < b.length - head && a[a.length - 1 - tail] === b[b.length - 1 - tail]) tail += 1
+  const midA = a.slice(head, a.length - tail)
+  const midB = b.slice(head, b.length - tail)
+
+  type Op = { kind: ' ' | '-' | '+'; text: string }
+  const ops: Op[] = []
+  if ((midA.length + 1) * (midB.length + 1) > MAX_DIFF_CELLS) {
+    ops.push(...midA.map(text => ({ kind: '-' as const, text })), ...midB.map(text => ({ kind: '+' as const, text })))
+  } else {
+    const width = midB.length + 1
+    const table = new Uint32Array((midA.length + 1) * width)
+    for (let i = midA.length - 1; i >= 0; i -= 1) {
+      for (let j = midB.length - 1; j >= 0; j -= 1) {
+        table[i * width + j] =
+          midA[i] === midB[j]
+            ? (table[(i + 1) * width + j + 1] ?? 0) + 1
+            : Math.max(table[(i + 1) * width + j] ?? 0, table[i * width + j + 1] ?? 0)
+      }
+    }
+    let i = 0
+    let j = 0
+    while (i < midA.length || j < midB.length) {
+      if (i < midA.length && j < midB.length && midA[i] === midB[j]) {
+        ops.push({ kind: ' ', text: midA[i] ?? '' })
+        i += 1
+        j += 1
+      } else if (j >= midB.length || (i < midA.length && (table[(i + 1) * width + j] ?? 0) >= (table[i * width + j + 1] ?? 0))) {
+        ops.push({ kind: '-', text: midA[i] ?? '' })
+        i += 1
+      } else {
+        ops.push({ kind: '+', text: midB[j] ?? '' })
+        j += 1
+      }
+    }
+  }
+
+  const ranges: Range[] = []
+  const text: string[] = [`--- a/${path}`, `+++ b/${path}`]
+  let oldLine = head + 1
+  let newLine = head + 1
+  let added = 0
+  let removed = 0
+  let index = 0
+  while (index < ops.length) {
+    if (ops[index]?.kind === ' ') {
+      oldLine += 1
+      newLine += 1
+      index += 1
+      continue
+    }
+    const hunk: Op[] = []
+    while (index < ops.length && ops[index]?.kind !== ' ') {
+      hunk.push(ops[index] as Op)
+      index += 1
+    }
+    const minus = hunk.filter(op => op.kind === '-').length
+    const plus = hunk.filter(op => op.kind === '+').length
+    text.push(`@@ -${oldLine},${minus} +${newLine},${plus} @@`, ...hunk.map(op => `${op.kind}${op.text}`))
+    ranges.push(plus > 0 ? [newLine, newLine + plus - 1] : [Math.max(1, newLine), Math.max(1, newLine)])
+    oldLine += minus
+    newLine += plus
+    added += plus
+    removed += minus
+  }
+  return { path, status, added, removed, ranges, text: ranges.length === 0 ? '' : text.join('\n') }
+}
+
 function indentOf(line: string): number {
   return (/^\s*/.exec(line)?.[0] ?? '').replace(/\t/g, '    ').length
 }

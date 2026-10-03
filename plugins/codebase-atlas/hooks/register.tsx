@@ -15,7 +15,7 @@ import type {
   Tab,
 } from '../types'
 import { bodyOf, calleesIn, enclosingSymbol, isDefinitionLine, symbolFromSelection } from './calls'
-import { countCallers, escapeRegex, markChanged, outlineOf, parseDiff, symbolChanges } from './changes'
+import { countCallers, escapeRegex, lineDiff, markChanged, outlineOf, parseDiff, symbolChanges } from './changes'
 import type { DiffFile, Range } from './changes'
 import {
   DECISION_MODEL,
@@ -26,7 +26,23 @@ import {
   explainModulePrompt,
   parseDecisions,
 } from './prompts'
-import { IMPORT_PATTERN, SOURCE_GLOBS, SYMBOL_PATTERN, buildScan, dependentsOf, grepLine, groupOf, shortCount } from './scan'
+import {
+  IMPORT_PATTERN,
+  IMPORT_RE,
+  SKIPPED_DIRS,
+  SOURCE_GLOBS,
+  SYMBOL_PATTERN,
+  SYMBOL_RE,
+  buildScan,
+  countTexts,
+  dependentsOf,
+  grepLine,
+  grepMatches,
+  grepTexts,
+  groupOf,
+  isSource,
+  shortCount,
+} from './scan'
 import type { Scan } from './scan'
 
 const graphAtom = atom({ plugin: 'codebase-atlas', key: 'graph' } as const, null)
@@ -48,10 +64,22 @@ const MAX_CALLER_NAMES = 25
 const MAX_CALLERS = 40
 const MAX_DECISIONS = 60
 const GIT_TIMEOUT_MS = 20_000
+const MAX_FOLDER_FILES = 1500
+const MAX_FOLDER_DIRS = 2000
+const MAX_FILE_BYTES = 512 * 1024
+
+type Source = { root: string; isGit: boolean }
 
 let cwd = ''
 let cache: Scan | null = null
 let isScanning = false
+let source: Source | null = null
+
+/** Folder mode: each source file's text and modification time as last read. */
+const current = new Map<string, { text: string; mtimeMs: number }>()
+/** Folder mode: each file as the first scan found it; null for a file that appeared after that scan. */
+const baseline = new Map<string, string | null>()
+let hasBaseline = false
 
 function setCwd(value: string): void {
   cwd = value
@@ -66,15 +94,21 @@ async function git($: EngineInterface, root: string, args: readonly string[]): P
   return { isOk: run.exitCode === 0 || isEmptyGrep, out: run.stdout, err: run.stderr.trim() }
 }
 
-async function findRoot($: EngineInterface): Promise<string | null> {
-  const known = (await read($, graphAtom))?.root ?? cache?.graph.root
-  if (known !== undefined) return known
+/** The folder Atlas reads: the git repository around the session, or else the session's own folder. */
+async function findSource($: EngineInterface): Promise<Source | null> {
+  if (source !== null) return source
   try {
     const run = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd: cwd || undefined, timeoutMs: 5000 })
-    return run.exitCode === 0 ? run.stdout.trim() : null
+    if (run.exitCode === 0 && run.stdout.trim() !== '') {
+      source = { root: run.stdout.trim(), isGit: true }
+      return source
+    }
   } catch {
-    return null
+    // No git on this machine: read the folder directly.
   }
+  if (cwd === '') return null
+  source = { root: cwd.replace(/\/+$/, ''), isGit: false }
+  return source
 }
 
 /** A path as the repo names it: relative to the root when inside it. */
@@ -97,24 +131,91 @@ async function readText($: EngineInterface, path: string): Promise<string> {
   }
 }
 
-/** Scans the repo for files, imports and definitions, and draws the map from them. */
+/** Folder mode: the source files under the root, leaving out dependencies, environments, caches and build output. */
+async function walkFolder($: EngineInterface, root: string): Promise<{ path: string; mtimeMs: number }[]> {
+  const found: { path: string; mtimeMs: number }[] = []
+  const queue = ['']
+  let dirs = 0
+  while (queue.length > 0 && found.length < MAX_FOLDER_FILES && dirs < MAX_FOLDER_DIRS) {
+    const dir = queue.shift() ?? ''
+    dirs += 1
+    let entries: Awaited<ReturnType<EngineInterface['fs']['list']>>
+    try {
+      entries = await $.fs.list(dir === '' ? root : `${root}/${dir}`)
+    } catch {
+      continue
+    }
+    if (dir !== '' && entries.some(entry => entry.name === 'pyvenv.cfg')) continue
+    for (const entry of entries) {
+      const path = dir === '' ? entry.name : `${dir}/${entry.name}`
+      if (entry.kind === 'dir' && !entry.isLink && !entry.name.startsWith('.') && !SKIPPED_DIRS.has(entry.name)) queue.push(path)
+      else if (entry.kind === 'file' && isSource(entry.name) && entry.size <= MAX_FILE_BYTES) found.push({ path, mtimeMs: entry.mtimeMs })
+    }
+  }
+  return found.sort((a, b) => a.path.localeCompare(b.path)).slice(0, MAX_FOLDER_FILES)
+}
+
+/** Folder mode: re-reads only files whose time changed; the first scan's texts stay as the baseline. */
+async function syncFolder($: EngineInterface, root: string): Promise<void> {
+  const listed = await walkFolder($, root)
+  const seen = new Set<string>()
+  for (const file of listed) {
+    seen.add(file.path)
+    if (current.get(file.path)?.mtimeMs === file.mtimeMs) continue
+    const text = await readText($, `${root}/${file.path}`)
+    current.set(file.path, { text, mtimeMs: file.mtimeMs })
+    if (!baseline.has(file.path)) baseline.set(file.path, hasBaseline ? null : text)
+  }
+  for (const path of [...current.keys()]) if (!seen.has(path)) current.delete(path)
+  hasBaseline = true
+}
+
+function currentTexts(): Map<string, string> {
+  return new Map([...current].map(([path, file]) => [path, file.text]))
+}
+
+/** Folder mode: the same scan git mode builds, from the texts in memory. */
+function folderScan(root: string): Scan {
+  const texts = currentTexts()
+  return buildScan(root, [...texts.keys()].join('\n'), countTexts(texts), grepTexts(texts, IMPORT_RE), grepTexts(texts, SYMBOL_RE), false)
+}
+
+/** Lines matching a pattern across the sources, as `git grep -n` prints them (`-o` with `isOnlyMatch`). */
+async function searchSources($: EngineInterface, src: Source, gitPattern: string, jsPattern: RegExp, isOnlyMatch: boolean): Promise<string> {
+  if (src.isGit) {
+    const flags = isOnlyMatch ? ['-n', '-o', '-I', '-E'] : ['-n', '-I', '-E']
+    return (await git($, src.root, ['grep', ...flags, gitPattern, '--', ...SOURCE_GLOBS])).out
+  }
+  return isOnlyMatch ? grepMatches(currentTexts(), jsPattern) : grepTexts(currentTexts(), jsPattern)
+}
+
+async function sourceText($: EngineInterface, src: Source, path: string): Promise<string> {
+  return src.isGit ? readText($, `${src.root}/${path}`) : (current.get(path)?.text ?? readText($, `${src.root}/${path}`))
+}
+
+/** Scans the code for files, imports and definitions, and draws the map from them. */
 async function scan($: EngineInterface): Promise<void> {
   if (isScanning) return
   isScanning = true
   await update($, scanStatusAtom, () => 'scanning')
   try {
     cache = null
-    const root = await findRoot($)
-    if (root === null) {
-      await update($, scanStatusAtom, () => 'no-git')
+    const src = await findSource($)
+    if (src === null) {
+      await update($, scanStatusAtom, () => 'no-folder')
       return
     }
-    const files = await git($, root, ['ls-files', '--', ...SOURCE_GLOBS])
-    if (!files.isOk) throw new Error(files.err || 'git ls-files failed')
-    const counts = await git($, root, ['grep', '-c', '-I', '', '--', ...SOURCE_GLOBS])
-    const imports = await git($, root, ['grep', '-n', '-I', '-E', IMPORT_PATTERN, '--', ...SOURCE_GLOBS])
-    const symbols = await git($, root, ['grep', '-n', '-I', '-E', SYMBOL_PATTERN, '--', ...SOURCE_GLOBS])
-    cache = buildScan(root, files.out, counts.out, imports.out, symbols.out)
+    if (src.isGit) {
+      const files = await git($, src.root, ['ls-files', '--', ...SOURCE_GLOBS])
+      if (!files.isOk) throw new Error(files.err || 'git ls-files failed')
+      const counts = await git($, src.root, ['grep', '-c', '-I', '', '--', ...SOURCE_GLOBS])
+      const imports = await git($, src.root, ['grep', '-n', '-I', '-E', IMPORT_PATTERN, '--', ...SOURCE_GLOBS])
+      const symbols = await git($, src.root, ['grep', '-n', '-I', '-E', SYMBOL_PATTERN, '--', ...SOURCE_GLOBS])
+      cache = buildScan(src.root, files.out, counts.out, imports.out, symbols.out, true)
+    } else {
+      await syncFolder($, src.root)
+      cache = folderScan(src.root)
+    }
     const graph = cache.graph
     await update($, graphAtom, () => graph)
     await update($, scanStatusAtom, () => 'ready')
@@ -139,42 +240,73 @@ async function recordActivity($: EngineInterface, path: string, kind: 'read' | '
   })
 }
 
-async function fileChange($: EngineInterface, root: string, diff: DiffFile): Promise<FileChange> {
-  const current = diff.status === 'deleted' ? '' : await readText($, `${root}/${diff.path}`)
-  const before = diff.status === 'added' ? '' : (await git($, root, ['show', `HEAD:${diff.path}`])).out
-  const symbols = symbolChanges(outlineOf(current, diff.path), outlineOf(before, diff.path), diff.ranges)
+function toFileChange(diff: DiffFile, after: string, before: string): FileChange {
+  const symbols = symbolChanges(outlineOf(after, diff.path), outlineOf(before, diff.path), diff.ranges)
   return { path: diff.path, group: groupOf(diff.path), status: diff.status, added: diff.added, removed: diff.removed, symbols }
 }
 
-/** Maps every uncommitted change to the functions and classes it touched, with callers and impact. */
+/** Git mode: uncommitted and untracked changes against HEAD. */
+async function gitChanges($: EngineInterface, root: string): Promise<FileChange[]> {
+  const diff = await git($, root, ['diff', '-U0', 'HEAD', '--', ...SOURCE_GLOBS])
+  const untracked = await git($, root, ['ls-files', '--others', '--exclude-standard', '--', ...SOURCE_GLOBS])
+  const diffs = parseDiff(diff.isOk ? diff.out : '')
+  for (const path of untracked.out.split('\n').filter(Boolean)) {
+    const lines = lineTotal(await readText($, `${root}/${path}`))
+    diffs.push({ path, status: 'added', added: lines, removed: 0, ranges: [[1, lines]] })
+  }
+  const files: FileChange[] = []
+  for (const one of diffs.slice(0, MAX_CHANGED_FILES)) {
+    const after = one.status === 'deleted' ? '' : await readText($, `${root}/${one.path}`)
+    const before = one.status === 'added' ? '' : (await git($, root, ['show', `HEAD:${one.path}`])).out
+    files.push(toFileChange(one, after, before))
+  }
+  return files
+}
+
+/** Folder mode: every file whose text differs from the baseline snapshot. */
+function folderDiffs(): (DiffFile & { text: string; before: string; after: string })[] {
+  const out: (DiffFile & { text: string; before: string; after: string })[] = []
+  for (const path of [...new Set([...baseline.keys(), ...current.keys()])].sort()) {
+    const before = baseline.get(path) ?? null
+    const after = current.get(path)?.text ?? null
+    if (before === after || (before === null && after === null)) continue
+    const diff = lineDiff(path, before, after)
+    if (diff.ranges.length === 0) continue
+    out.push({ ...diff, before: before ?? '', after: after ?? '' })
+    if (out.length >= MAX_CHANGED_FILES) break
+  }
+  return out
+}
+
+/** Maps every change to the functions and classes it touched, with call sites, layers and impact. */
 async function refreshChanges($: EngineInterface): Promise<void> {
   await update($, changesAtom, (current): ChangeMap => ({ ...current, status: 'loading' }))
   try {
-    const root = await findRoot($)
-    if (root === null) throw new Error('Codebase Atlas needs a git repository.')
-    const scanned = await ensureScan($)
-
-    const diff = await git($, root, ['diff', '-U0', 'HEAD', '--', ...SOURCE_GLOBS])
-    const untracked = await git($, root, ['ls-files', '--others', '--exclude-standard', '--', ...SOURCE_GLOBS])
-    const diffs = parseDiff(diff.isOk ? diff.out : '')
-    for (const path of untracked.out.split('\n').filter(Boolean)) {
-      const lines = lineTotal(await readText($, `${root}/${path}`))
-      diffs.push({ path, status: 'added', added: lines, removed: 0, ranges: [[1, lines]] })
+    const src = await findSource($)
+    if (src === null) throw new Error('Codebase Atlas could not tell which folder to read.')
+    let scanned = await ensureScan($)
+    let files: FileChange[]
+    if (src.isGit) {
+      files = await gitChanges($, src.root)
+    } else {
+      await syncFolder($, src.root)
+      scanned = folderScan(src.root)
+      cache = scanned
+      const graph = scanned.graph
+      await update($, graphAtom, () => graph)
+      files = folderDiffs().map(diff => toFileChange(diff, diff.after, diff.before))
     }
-
-    const files: FileChange[] = []
-    for (const one of diffs.slice(0, MAX_CHANGED_FILES)) files.push(await fileChange($, root, one))
 
     const names = [...new Set(files.flatMap(file => file.symbols.filter(s => s.change !== 'removed').map(s => s.name)))]
       .filter(name => /^[A-Za-z_$][\w$]*$/.test(name))
       .slice(0, MAX_CALLER_NAMES)
     if (names.length > 0) {
-      const pattern = `[A-Za-z0-9_$]*(${names.map(escapeRegex).join('|')})[[:space:]]*\\(`
-      const hits = await git($, root, ['grep', '-n', '-o', '-I', '-E', pattern, '--', ...SOURCE_GLOBS])
+      const alternatives = names.map(escapeRegex).join('|')
+      const hits = await searchSources($, src, `[A-Za-z0-9_$]*(${alternatives})[[:space:]]*\\(`, new RegExp(`[A-Za-z0-9_$]*(${alternatives})\\s*\\(`), true)
       const definitions = new Set<string>()
       for (const [name, sites] of scanned?.symbols ?? []) for (const site of sites) definitions.add(`${site.file}:${site.line}:${name}`)
       for (const file of files) for (const s of file.symbols) definitions.add(`${file.path}:${s.line}:${s.name}`)
-      const counts = countCallers(hits.out, definitions, new Set(names))
+      const counts = countCallers(hits, definitions, new Set(names))
       for (const file of files) for (const s of file.symbols) s.callers = counts.get(s.name) ?? 0
     }
 
@@ -193,14 +325,20 @@ async function loadOutline($: EngineInterface, path: string): Promise<void> {
   await update($, outlineAtom, (): Outline => ({ file: path, status: 'loading', lines: 0, entries: [] }))
   await update($, tabAtom, () => 'components')
   try {
-    const root = await findRoot($)
-    if (root === null) throw new Error('Codebase Atlas needs a git repository.')
+    const src = await findSource($)
+    if (src === null) throw new Error('Codebase Atlas could not tell which folder to read.')
     const scanned = await ensureScan($)
-    const text = await readText($, `${root}/${path}`)
+    const text = await sourceText($, src, path)
     if (text === '') throw new Error(`Could not read ${path}.`)
-    const diff = parseDiff((await git($, root, ['diff', '-U0', 'HEAD', '--', path])).out)[0]
-    const isUntracked = (await git($, root, ['ls-files', '--', path])).out.trim() === ''
-    const ranges: Range[] = isUntracked ? [[1, lineTotal(text)]] : (diff?.ranges ?? [])
+    let ranges: Range[]
+    if (src.isGit) {
+      const diff = parseDiff((await git($, src.root, ['diff', '-U0', 'HEAD', '--', path])).out)[0]
+      const isUntracked = (await git($, src.root, ['ls-files', '--', path])).out.trim() === ''
+      ranges = isUntracked ? [[1, lineTotal(text)]] : (diff?.ranges ?? [])
+    } else {
+      const before = baseline.get(path)
+      ranges = before === undefined ? [] : lineDiff(path, before, text).ranges
+    }
     const entries = markChanged(outlineOf(text, path), ranges).map(entry => ({
       ...entry,
       calls: entry.kind === 'class' ? [] : calleesIn(bodyOf(text, entry.line, path), entry.name, scanned?.symbols ?? new Map())
@@ -226,23 +364,23 @@ async function loadCalls($: EngineInterface, symbol: string, isFromTrail = false
   await update($, tabAtom, () => 'calls')
   if (!isFromTrail) await update($, trailAtom, trail => [...trail.filter(one => one !== name), name].slice(-20))
   try {
-    const root = await findRoot($)
-    if (root === null) throw new Error('Codebase Atlas needs a git repository.')
+    const src = await findSource($)
+    if (src === null) throw new Error('Codebase Atlas could not tell which folder to read.')
     const scanned = await ensureScan($)
     const index = scanned?.symbols ?? new Map<string, Site[]>()
     const definition = index.get(name)?.[0]
 
     const texts = new Map<string, string>()
     const textOf = async (file: string): Promise<string> => {
-      if (!texts.has(file)) texts.set(file, await readText($, `${root}/${file}`))
+      if (!texts.has(file)) texts.set(file, await sourceText($, src, file))
       return texts.get(file) ?? ''
     }
 
-    const pattern = `(^|[^A-Za-z0-9_$])${escapeRegex(name)}[[:space:]]*\\(`
-    const hits = await git($, root, ['grep', '-n', '-I', '-E', pattern, '--', ...SOURCE_GLOBS])
+    const escaped = escapeRegex(name)
+    const hits = await searchSources($, src, `(^|[^A-Za-z0-9_$])${escaped}[[:space:]]*\\(`, new RegExp(`(^|[^A-Za-z0-9_$])${escaped}\\s*\\(`), false)
     const callers: Site[] = []
     const seen = new Set<string>()
-    for (const row of hits.out.split('\n')) {
+    for (const row of hits.split('\n')) {
       const hit = grepLine(row)
       if (hit === null || isDefinitionLine(hit.text, name)) continue
       const caller = enclosingSymbol(await textOf(hit.file), hit.line, hit.file)
@@ -283,7 +421,7 @@ async function showInsight($: EngineInterface, title: string, prompt: () => Prom
 async function explainModule($: EngineInterface, id: string): Promise<void> {
   await showInsight($, `Folder ${id}`, async () => {
     const scanned = await ensureScan($)
-    const files = [...(scanned?.imports.keys() ?? [])].filter(file => groupOf(file) === id)
+    const files = [...new Set([...(scanned?.symbols.values() ?? [])].flat().map(site => site.file))].filter(file => groupOf(file) === id)
     const symbols = [...(scanned?.symbols ?? new Map<string, Site[]>())]
       .filter(([, sites]) => sites.some(site => groupOf(site.file) === id))
       .map(([name]) => name)
@@ -300,9 +438,9 @@ async function explainModule($: EngineInterface, id: string): Promise<void> {
 
 async function explainFunction($: EngineInterface, view: CallView): Promise<void> {
   await showInsight($, `Function ${view.symbol}`, async () => {
-    const root = await findRoot($)
+    const src = await findSource($)
     const definition = view.definition
-    const body = definition === undefined || root === null ? '' : bodyOf(await readText($, `${root}/${definition.file}`), definition.line, definition.file).join('\n')
+    const body = definition === undefined || src === null ? '' : bodyOf(await sourceText($, src, definition.file), definition.line, definition.file).join('\n')
     return explainFunctionPrompt(
       view.symbol,
       definition?.file ?? 'an unknown file',
@@ -319,8 +457,8 @@ async function explainChanges($: EngineInterface): Promise<void> {
     const summary = changes.files
       .map(file => `${file.path} (+${file.added} −${file.removed}): ${file.symbols.map(s => `${s.change} ${s.name}`).join(', ') || 'no function-level change'}`)
       .join('\n')
-    const root = await findRoot($)
-    const diff = root === null ? '' : (await git($, root, ['diff', 'HEAD', '--', ...SOURCE_GLOBS])).out
+    const src = await findSource($)
+    const diff = src === null ? '' : src.isGit ? (await git($, src.root, ['diff', 'HEAD', '--', ...SOURCE_GLOBS])).out : folderDiffs().map(one => one.text).join('\n')
     return explainChangesPrompt(summary || 'No changes found.', diff)
   })
 }
@@ -397,6 +535,7 @@ function mapView($: EngineInterface, t: T, graph: Graph, activity: readonly Acti
         <Text dimColor>
           {graph.files} files · {graph.groups.length} folders{graph.isTruncated ? ' (largest shown)' : ''}
         </Text>
+        {!graph.isGit && <Text color="magenta">folder mode (no git)</Text>}
         <Text color="yellow">■ edited</Text>
         <Text color="cyan">■ read</Text>
         <Text dimColor>■ untouched</Text>
@@ -462,7 +601,7 @@ function mapView($: EngineInterface, t: T, graph: Graph, activity: readonly Acti
   )
 }
 
-function changesView($: EngineInterface, t: T, changes: ChangeMap): RenderNode {
+function changesView($: EngineInterface, t: T, changes: ChangeMap, isGit: boolean): RenderNode {
   const { Box, Text, Button } = t
   const added = changes.files.reduce((sum, file) => sum + file.added, 0)
   const removed = changes.files.reduce((sum, file) => sum + file.removed, 0)
@@ -471,8 +610,11 @@ function changesView($: EngineInterface, t: T, changes: ChangeMap): RenderNode {
     <Box flexDirection="column">
       {changes.status === 'loading' && <Text color="cyan">Mapping changes to functions…</Text>}
       {changes.status === 'error' && <Text color="red">{changes.error}</Text>}
-      {changes.status === 'idle' && <Text dimColor>Press refresh to map the uncommitted changes to the functions they touch.</Text>}
-      {changes.status === 'ready' && changes.files.length === 0 && <Text dimColor>No uncommitted changes in source files.</Text>}
+      {changes.status === 'idle' && <Text dimColor>Press refresh to map the changes to the functions they touch.</Text>}
+      {!isGit && <Text dimColor>No git here: changes are compared with the files as Codebase Atlas first read them this session.</Text>}
+      {changes.status === 'ready' && changes.files.length === 0 && (
+        <Text dimColor>{isGit ? 'No uncommitted changes in source files.' : 'No changes since Codebase Atlas first read this folder.'}</Text>
+      )}
       {changes.files.length > 0 && (
         <Box flexDirection="column">
           <Box flexDirection="row" gap={1}>
@@ -845,12 +987,12 @@ export const register: Register = (on, options) => {
     if (tab === 'map') {
       body =
         status === 'scanning' ? <Text color="cyan">Scanning the repository…</Text>
-        : status === 'no-git' ? <Text color="red">Codebase Atlas needs a git repository in this session's folder.</Text>
+        : status === 'no-folder' ? <Text color="red">Codebase Atlas could not tell which folder to read. Start Claude Code inside your project.</Text>
         : status === 'error' ? <Text color="red">Scan failed: {await read($, scanErrorAtom)}</Text>
         : graph === null ? <Text dimColor>Starting the first scan…</Text>
         : mapView($, t, graph, activity, await read($, focusAtom))
     } else if (tab === 'changes') {
-      body = changesView($, t, await read($, changesAtom))
+      body = changesView($, t, await read($, changesAtom), graph?.isGit ?? true)
     } else if (tab === 'components') {
       const recent = [...new Set([...(await read($, changesAtom)).files.map(file => file.path), ...activity.map(one => relative(one.path, root))])]
       body = componentsView($, t, await read($, outlineAtom), recent, e.props.bodyColumns)

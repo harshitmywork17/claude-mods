@@ -13,13 +13,15 @@ export type Edge = { from: string; to: string; count: number }
 
 export type Graph = {
   root: string
+  /** False when the folder has no git: changes are then measured against the first scan's snapshot. */
+  isGit: boolean
   files: number
   groups: Group[]
   edges: Edge[]
   isTruncated: boolean
 }
 
-export type ScanStatus = 'idle' | 'scanning' | 'ready' | 'no-git' | 'error'
+export type ScanStatus = 'idle' | 'scanning' | 'ready' | 'no-folder' | 'error'
 
 /** What Claude did to one file this session; `path` is absolute as the tools name it. */
 export type Activity = { path: string; reads: number; edits: number }

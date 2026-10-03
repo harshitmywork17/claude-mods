@@ -3,9 +3,9 @@ import type { On } from 'claude-code'
 import type { Engine, MockClock } from 'claude-code/testing'
 
 import { calleesIn, enclosingSymbol } from '../hooks/calls'
-import { outlineOf, parseDiff, symbolChanges } from '../hooks/changes'
+import { lineDiff, outlineOf, parseDiff, symbolChanges } from '../hooks/changes'
 import { parseDecisions } from '../hooks/prompts'
-import { buildScan } from '../hooks/scan'
+import { buildScan, grepMatches, grepTexts } from '../hooks/scan'
 
 const ROOT = '/repo'
 
@@ -101,10 +101,30 @@ function gitAnswer(argv: readonly string[]) {
   return { value: { exitCode: 128, stdout: '', stderr: `unexpected: ${args}`, isStdoutTruncated: false, isStderrTruncated: false } }
 }
 
-type Seen = { forks: string[]; completions: string[] }
+type Seen = { forks: string[]; completions: string[]; reads: string[] }
+type Disk = Map<string, { text: string; mtimeMs: number }>
 
-function engineBeneath(on: On, isGitRepo = true): { clock: MockClock; seen: Seen } {
-  const seen: Seen = { forks: [], completions: [] }
+function diskOf(files: Record<string, string>): Disk {
+  return new Map(Object.entries(files).map(([path, text]) => [path, { text, mtimeMs: 1 }]))
+}
+
+/** What `$.fs.list` answers for a directory of the fake disk. */
+function listing(disk: Disk, dir: string) {
+  const prefix = dir === ROOT ? '' : `${dir.slice(ROOT.length + 1)}/`
+  const entries = new Map<string, { name: string; kind: 'file' | 'dir'; size: number; mtimeMs: number; isLink: boolean }>()
+  for (const [path, file] of disk) {
+    if (!path.startsWith(prefix)) continue
+    const rest = path.slice(prefix.length)
+    const [name = '', ...deeper] = rest.split('/')
+    entries.set(name, deeper.length > 0
+      ? { name, kind: 'dir', size: 0, mtimeMs: 0, isLink: false }
+      : { name, kind: 'file', size: file.text.length, mtimeMs: file.mtimeMs, isLink: false })
+  }
+  return [...entries.values()]
+}
+
+function engineBeneath(on: On, isGitRepo = true, disk: Disk = diskOf(FILES)): { clock: MockClock; seen: Seen } {
+  const seen: Seen = { forks: [], completions: [], reads: [] }
   const clock = mock.clock(on)
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', () => ({ value: { command: 'atlas' } }))
@@ -115,7 +135,11 @@ function engineBeneath(on: On, isGitRepo = true): { clock: MockClock; seen: Seen
       ? { value: { exitCode: 128, stdout: '', stderr: 'not a git repository', isStdoutTruncated: false, isStderrTruncated: false } }
       : gitAnswer(e.argv),
   )
-  on('fs.read', (_$, e) => ({ value: FILES[e.path.replace(`${ROOT}/`, '')] ?? '' }))
+  on('fs.read', (_$, e) => {
+    seen.reads.push(e.path)
+    return { value: disk.get(e.path.replace(`${ROOT}/`, ''))?.text ?? '' }
+  })
+  on('fs.list', (_$, e) => ({ value: listing(disk, e.path) }))
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
   on('tool.call', () => ({ result: {} as never, text: 'ok' }))
@@ -158,6 +182,26 @@ describe('parsing', () => {
       ['execute_sql', 'modified'],
       ['retry', 'added'],
     ])
+  })
+
+  test('a line diff finds each changed block, as git diff -U0 would', () => {
+    const diff = lineDiff('t.py', HEAD_TOOLS, FILES['app/services/tools.py'] ?? '')
+    expect(diff.ranges).toEqual([[6, 10]])
+    expect(lineDiff('two.py', 'a\nb\nc\nd\ne\n', 'A\nb\nc\nd\nE\n').ranges).toEqual([
+      [1, 1],
+      [5, 5],
+    ])
+    expect([diff.added, diff.removed, diff.status]).toEqual([5, 1, 'modified'])
+    expect(diff.text).toMatch(/^@@ -6,1 \+6,5 @@\n-    return session\.run\(sql\)\n\+    return retry/m)
+    expect(lineDiff('n.py', null, 'a\nb\n')).toMatchObject({ status: 'added', added: 2, ranges: [[1, 2]] })
+    expect(lineDiff('d.py', 'a\n', null)).toMatchObject({ status: 'deleted', removed: 1 })
+    expect(lineDiff('same.py', 'a\n', 'a\n').ranges).toEqual([])
+  })
+
+  test('searching texts in memory prints what git grep prints', () => {
+    const texts = new Map([['a.py', 'def f():\n    g(1)\n    h( g(2) )\n']])
+    expect(grepTexts(texts, /g\s*\(/)).toBe('a.py:2:    g(1)\na.py:3:    h( g(2) )')
+    expect(grepMatches(texts, /[A-Za-z_]*(g|h)\s*\(/)).toBe('a.py:2:g(\na.py:3:h(\na.py:3:g(')
   })
 
   test('callers, callees and decisions', () => {
@@ -267,9 +311,46 @@ test('decisions are pulled from a finished turn into the timeline', async ($, on
   expect(await ui.find({ type: 'Text', text: 'instead of: retry inside the driver' })).toBeDefined()
 })
 
-test('without git the map says so instead of failing', async ($, on) => {
-  const { clock } = engineBeneath(on, false)
+test('without git it reads the folder, skips environments, and maps changes against its first snapshot', async ($, on) => {
+  const disk = diskOf({
+    ...FILES,
+    'app/services/tools.py': HEAD_TOOLS,
+    'li/pyvenv.cfg': 'home = /usr/bin',
+    'li/lib/site.py': 'def hidden():\n    pass\n',
+    'node_modules/pkg/index.js': 'function nope() {}\n',
+    'README.md': '# not code\n',
+  })
+  disk.delete('app/services/cache.py')
+  const { clock, seen } = engineBeneath(on, false, disk)
   await startSession($, clock)
+
+  const map = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await map.find({ type: 'Text', text: 'folder mode (no git)' })).toBeDefined()
+  expect(await map.find({ type: 'Text', text: '5 files · 3 folders' })).toBeDefined()
+  await map.unmount()
+  expect(seen.reads.some(path => path.includes('/li/') || path.includes('node_modules') || path.endsWith('.md'))).toBe(false)
+
+  await $.turn.start({ turnId: 't1', text: 'add retries' })
+  disk.set('app/services/tools.py', { text: FILES['app/services/tools.py'] ?? '', mtimeMs: 2 })
+  disk.set('app/services/cache.py', { text: FILES['app/services/cache.py'] ?? '', mtimeMs: 2 })
+  await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/app/services/tools.py`, old_string: 'a', new_string: 'b' })
+  await $.turn.complete({ answer: 'Added retry().', durationMs: 1, isAborted: false, reason: 'answer', turnId: 't1' })
+  await clock.advance(1000)
+
+  const reads = seen.reads.length
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /needs a git repository/ })).toBeDefined()
+  await ui.press({ key: 'tab:changes' })
+  expect(await ui.find({ type: 'Text', text: /No git here: changes are compared/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: 'app/services/tools.py' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /modified · L4 · 1 call site$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /added · L9 · 1 call site$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: 'app/services/cache.py' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: '▸ app/services/sql_agent.py' })).toBeDefined()
+
+  await ui.press({ key: 'cfile:1' })
+  expect(await ui.findAll({ type: 'Text', text: '● changed' })).toHaveLength(2)
+  await ui.press({ key: 'tab:calls' })
+  await ui.input({ key: 'symbol', text: 'execute_sql' })
+  expect(await ui.find({ type: 'Text', text: '▲ Called by (1)' })).toBeDefined()
+  expect(seen.reads.length - reads).toBeLessThanOrEqual(1)
 })

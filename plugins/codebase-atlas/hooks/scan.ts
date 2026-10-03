@@ -10,6 +10,52 @@ export const IMPORT_PATTERN =
 export const SYMBOL_PATTERN =
   '^[[:space:]]*(async[[:space:]]+)?def[[:space:]]+[A-Za-z_]|^[[:space:]]*class[[:space:]]+[A-Za-z_]|function[[:space:]]*\\*?[[:space:]]+[A-Za-z_$]|^[[:space:]]*(export[[:space:]]+)?(const|let)[[:space:]]+[A-Za-z_$][A-Za-z0-9_$]*[[:space:]]*=[[:space:]]*(async[[:space:]]*)?(\\(|function|[A-Za-z_$][A-Za-z0-9_$]*[[:space:]]*=>)'
 
+/** The same two patterns as JavaScript expressions, for folders searched without git. */
+export const IMPORT_RE = /^\s*(import|from)\s|require\(|^\s*export\s.*\sfrom\s/
+export const SYMBOL_RE =
+  /^\s*(async\s+)?def\s+[A-Za-z_]|^\s*class\s+[A-Za-z_]|function\s*\*?\s+[A-Za-z_$]|^\s*(export\s+)?(const|let)\s+[A-Za-z_$][\w$]*\s*=\s*(async\s*)?(\(|function|[A-Za-z_$][\w$]*\s*=>)/
+
+export const SOURCE_EXTENSIONS = ['.py', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']
+
+/** Folders a walk without git never enters: dependencies, environments, caches and build output. */
+export const SKIPPED_DIRS = new Set([
+  'node_modules', 'venv', '.venv', 'env', '.env', '__pycache__', 'dist', 'build', 'out', 'target', 'coverage',
+  'site-packages', '.git', '.hg', '.svn', '.next', '.nuxt', '.tox', '.mypy_cache', '.pytest_cache', '.ruff_cache',
+  '.idea', '.vscode', '.cache', '.turbo', 'vendor',
+])
+
+export function isSource(name: string): boolean {
+  return SOURCE_EXTENSIONS.some(ext => name.endsWith(ext)) && !name.endsWith('.d.ts') && !name.endsWith('.min.js')
+}
+
+/** What `git grep -n -E` prints, produced from texts held in memory. */
+export function grepTexts(texts: ReadonlyMap<string, string>, pattern: RegExp): string {
+  const out: string[] = []
+  for (const [path, text] of texts) {
+    text.split('\n').forEach((line, index) => {
+      if (pattern.test(line)) out.push(`${path}:${index + 1}:${line}`)
+    })
+  }
+  return out.join('\n')
+}
+
+/** What `git grep -n -o -E` prints: each match on its own line. */
+export function grepMatches(texts: ReadonlyMap<string, string>, pattern: RegExp): string {
+  const global = new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`)
+  const out: string[] = []
+  for (const [path, text] of texts) {
+    text.split('\n').forEach((line, index) => {
+      for (const match of line.matchAll(global)) out.push(`${path}:${index + 1}:${match[0]}`)
+    })
+  }
+  return out.join('\n')
+}
+
+/** What `git grep -c ''` prints: the line count of each file. */
+export function countTexts(texts: ReadonlyMap<string, string>): string {
+  return [...texts].map(([path, text]) => `${path}:${text.split('\n').length - (text.endsWith('\n') ? 1 : 0)}`).join('\n')
+}
+
 export const MAX_FILES = 4000
 const MAX_GROUPS = 80
 const MAX_EDGES = 1000
@@ -151,8 +197,8 @@ export function levels(ids: readonly string[], edges: readonly Edge[]): Map<stri
   return new Map(ids.map(id => [id, level(id)]))
 }
 
-/** Builds the map and indexes from the four git outputs a scan collects. */
-export function buildScan(root: string, fileList: string, lineCounts: string, importLines: string, symbolLines: string): Scan {
+/** Builds the map and indexes from the four git outputs a scan collects, or their in-memory equivalents. */
+export function buildScan(root: string, fileList: string, lineCounts: string, importLines: string, symbolLines: string, isGit = true): Scan {
   const fileNames = fileList.split('\n').filter(Boolean)
   const isTruncated = fileNames.length > MAX_FILES
   const files = new Set(fileNames.slice(0, MAX_FILES))
@@ -230,7 +276,7 @@ export function buildScan(root: string, fileList: string, lineCounts: string, im
     .sort((a, b) => b.level - a.level || a.id.localeCompare(b.id))
 
   return {
-    graph: { root, files: files.size, groups, edges: keptEdges, isTruncated: isTruncated || kept.size < groupFiles.size },
+    graph: { root, isGit, files: files.size, groups, edges: keptEdges, isTruncated: isTruncated || kept.size < groupFiles.size },
     imports,
     symbols,
   }
