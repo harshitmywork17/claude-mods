@@ -1,0 +1,17 @@
+{
+  "name": "session-meter",
+  "version": "0.1.0",
+  "description": "Status line meter: elapsed time, tool calls and files edited this session, plus a toast when a long turn finishes.",
+  "author": {
+    "name": "harshitmywork17"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "toastAfterSeconds": {
+      "type": "number",
+      "title": "Toast after (seconds)",
+      "description": "Show a toast when a turn takes at least this long. 0 turns the toast off.",
+      "default": 60
+    }
+  }
+}

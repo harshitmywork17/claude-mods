@@ -1,0 +1,9 @@
+{
+  "name": "replay-theater",
+  "version": "0.1.0",
+  "description": "Records every file edit Claude makes in a turn; /replay steps through the diffs one at a time in a docked pane.",
+  "author": {
+    "name": "harshitmywork17"
+  },
+  "types": "./types/index.d.ts"
+}

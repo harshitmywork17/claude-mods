@@ -1,0 +1,9 @@
+{
+  "name": "changed-files",
+  "version": "0.1.0",
+  "description": "A live sidebar of every file Claude touched this session, with +/- line counts.",
+  "author": {
+    "name": "harshitmywork17"
+  },
+  "types": "./types/index.d.ts"
+}
