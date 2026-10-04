@@ -1,0 +1,7 @@
+{
+  "name": "crew",
+  "version": "0.1.0",
+  "description": "Agents side pane: every subagent as a little pixel crew member with its model, effort, context, tokens, cost and time; running, completed and planned tasks with their dependencies. /crew",
+  "author": { "name": "harshitmywork17" },
+  "types": "./types/index.d.ts"
+}

@@ -77,6 +77,11 @@
       "name": "workbench",
       "source": "./plugins/workbench",
       "description": "One workspace: a one-line band above the prompt and a pane with Now, Changes (diffstat, changed functions, highlighted diffs, replay), live Preview, Artifacts, Code Map and Usage. /wb"
+    },
+    {
+      "name": "crew",
+      "source": "./plugins/crew",
+      "description": "Agents side pane: each subagent as a pixel crew member with model, effort, context, tokens, cost and time; running, completed and planned tasks with dependencies. /crew"
     }
   ]
 }
