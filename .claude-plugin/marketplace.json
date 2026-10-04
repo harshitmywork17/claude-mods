@@ -87,6 +87,26 @@
       "name": "explainer-page",
       "source": "./plugins/explainer-page",
       "description": "Textbook-style interactive HTML explainer pages with colour-coded notation, linked figures and tables, and runnable code. Used only when you ask for a visual or interactive explainer page."
+    },
+    {
+      "name": "savvy-flow",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/JohnnyVizz/claude-kit.git",
+        "path": "plugins/savvy-flow",
+        "sha": "272a877f39b6971690e087b16a7cc3951b811e39"
+      },
+      "description": "From johnnyvizz/claude-kit: /savvy-flow:savvy-flow <task> plans, delegates to tiered worker subagents (fable, heavy, careful, medium, light) and reviews their work."
+    },
+    {
+      "name": "savvy-progress",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/JohnnyVizz/claude-kit.git",
+        "path": "plugins/savvy-progress",
+        "sha": "272a877f39b6971690e087b16a7cc3951b811e39"
+      },
+      "description": "From johnnyvizz/claude-kit: a progress bar above the prompt and an agents panel (/agents-info); animated crabs in the desktop app, text rows in the terminal."
     }
   ]
 }
