@@ -24,7 +24,7 @@ One concept per page; a page has 3 to 6 numbered sections. Before writing, settl
 - **The question the concept answers**: the problem a reader would hit without it.
 - **Prerequisites**: what the reader must already know; name them in the opening paragraph rather than teaching them.
 - **The one picture**: the figure that makes the idea click. Every page has at least one figure; a page about a formula has a figure of what the formula computes.
-- **The worked numbers**: a small concrete example (a 5-word vocabulary, a 3-feature input, a 4×4 matrix) used throughout the page.
+- **The worked numbers**: a small concrete example (a 5-word vocabulary, a 3-feature input, a 4×4 matrix) used throughout the page. Choose them so every figure shows a contrast: a decision line that splits the points, a distribution with one clear peak, a change that flips a result. Numbers where everything lands on one side teach nothing. Keep quantities realistic: counts are whole numbers.
 
 ### 2. Fix the notation before drafting
 
@@ -92,7 +92,7 @@ Fix what you see before delivering.
 
 ### 7. Deliver
 
-- When an Artifact tool is available, publish the page with it, following that tool's own rules (it may require loading a design guide first; the template already defines colours as `:root` tokens with dark-mode overrides and loads scripts only from cdnjs and jsdelivr, which artifact pages allow).
+- When an Artifact tool is available, publish the page with it, following that tool's own rules (it may require a quickstart call or a design guide first). Artifact pages are wrapped in their own document at publish time, so publish the file without the `<!doctype html>`, `<html>`, `<head>` and `<body>` tags: start with `<title>`, the font `<link>` and `<style>`, then the page, then the scripts. The template already follows the rest of the artifact rules: colour tokens on `:root` with dark-mode overrides and `color-scheme`, scripts only from cdnjs and jsdelivr, a sticky header offset by the safe area, and a copy button that falls back to selecting the code.
 - Otherwise write the `.html` file and give its path. It opens directly in a browser.
 
 ## Writing voice
@@ -107,7 +107,7 @@ Fix what you see before delivering.
 
 Load only what the page uses, from these sources:
 
-- MathJax 3 (`cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js`), already in the template. It renders to SVG and needs no stylesheet.
+- MathJax 3, full build (`cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-svg-full.js`), already in the template. It renders to SVG, needs no stylesheet, and bundles every TeX extension, so it makes no runtime fetches (artifact pages block them).
 - highlight.js (`cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js`), already in the template; its colours come from the template's CSS.
 - When a figure truly needs more than the template's helpers: D3 or Three.js from cdnjs.
 

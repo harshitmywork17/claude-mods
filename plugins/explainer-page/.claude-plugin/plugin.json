@@ -1,7 +1,9 @@
 {
   "name": "explainer-page",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Textbook-style interactive HTML explainer pages: colour-coded notation shared by prose, maths, figures, tables and code; linked figures drawn from one data source; runnable code with real output.",
-  "author": { "name": "harshitmywork17" },
+  "author": {
+    "name": "harshitmywork17"
+  },
   "license": "MIT"
 }

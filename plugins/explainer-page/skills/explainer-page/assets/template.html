@@ -19,10 +19,10 @@
 -->
 <style>
 :root {
-  --bg: #fbfaf7; --panel: #f2f0ea; --ink: #1f2328; --muted: #5f6670; --rule: #d9d5cc; --hover: #ebe7dd;
+  --bg: #f7f8fa; --panel: #eceff4; --ink: #1d2129; --muted: #5d6573; --rule: #d6dbe3; --hover: #e4e8ef;
   --in: #1f6feb; --out: #c2610c; --prm: #1a7f55; --fn: #7c4dbd; --pr: #c0306a;
   --bar: #a9adb4; --bar-side: #8b9098; --bar-top: #c7cad0;
-  --code-bg: #f4f2ec; --kw: #7c4dbd; --str: #1a7f55; --num: #c2610c; --com: #8a8f98;
+  --code-bg: #eef1f5; --kw: #7c4dbd; --str: #1a7f55; --num: #c2610c; --com: #8a8f98;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -30,6 +30,7 @@
     --in: #6ea8fe; --out: #f0a35e; --prm: #5fd3a0; --fn: #b392f0; --pr: #f27fa0;
     --bar: #6b7078; --bar-side: #4e535b; --bar-top: #8a8f97;
     --code-bg: #171a1f; --kw: #b392f0; --str: #5fd3a0; --num: #f0a35e; --com: #6c727b;
+    color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
@@ -37,6 +38,7 @@
   --in: #6ea8fe; --out: #f0a35e; --prm: #5fd3a0; --fn: #b392f0; --pr: #f27fa0;
   --bar: #6b7078; --bar-side: #4e535b; --bar-top: #8a8f97;
   --code-bg: #171a1f; --kw: #b392f0; --str: #5fd3a0; --num: #f0a35e; --com: #6c727b;
+  color-scheme: dark;
 }
 /* Notation off: every role reads in the body colour. */
 body.mono { --in: var(--ink); --out: var(--ink); --prm: var(--ink); --fn: var(--ink); --pr: var(--ink); }
@@ -53,7 +55,7 @@ code, pre, .mono-font { font-family: "JetBrains Mono", ui-monospace, monospace; 
 
 /* Shell */
 .topbar {
-  position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 12px;
+  position: sticky; top: env(safe-area-inset-top, 0px); z-index: 10; display: flex; align-items: center; gap: 12px;
   padding: 10px 16px; background: color-mix(in srgb, var(--bg) 88%, transparent);
   backdrop-filter: blur(6px); border-bottom: 1px solid var(--rule);
 }
@@ -63,9 +65,11 @@ code, pre, .mono-font { font-family: "JetBrains Mono", ui-monospace, monospace; 
   font: 13px "JetBrains Mono", monospace; padding: 4px 9px; cursor: pointer;
 }
 .icon-btn:hover { color: var(--ink); }
+button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px solid var(--out); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
 .layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); }
 .toc {
-  position: sticky; top: 49px; height: calc(100vh - 49px); overflow-y: auto;
+  position: sticky; top: calc(49px + env(safe-area-inset-top, 0px)); height: calc(100vh - 49px); overflow-y: auto;
   padding: 22px 14px 40px 18px; border-right: 1px solid var(--rule); font-size: 15px;
 }
 .toc a { display: block; color: var(--muted); text-decoration: none; padding: 3px 0 3px 10px; border-left: 2px solid transparent; }
@@ -76,7 +80,7 @@ main { padding: 28px 300px 120px 56px; max-width: 1180px; }
 @media (max-width: 1200px) { main { padding-right: 40px; } }
 @media (max-width: 860px) {
   .layout { grid-template-columns: minmax(0, 1fr); }
-  .toc { position: fixed; left: 0; top: 49px; width: 270px; background: var(--bg); transform: translateX(-100%); transition: transform .2s; z-index: 9; }
+  .toc { position: fixed; left: 0; top: calc(49px + env(safe-area-inset-top, 0px)); width: 270px; background: var(--bg); transform: translateX(-100%); transition: transform .2s; z-index: 9; }
   body.toc-open .toc { transform: none; }
   main { padding: 20px 16px 100px; }
 }
@@ -212,7 +216,6 @@ A table of every pair grows as \(|V|^2\). With a real vocabulary of 50,000 words
 
 <script>
 window.MathJax = {
-  loader: { load: ['[tex]/html'] },
   tex: {
     packages: { '[+]': ['html'] },
     inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']],
@@ -222,10 +225,10 @@ window.MathJax = {
     },
   },
   svg: { fontCache: 'global' },
-  startup: { typeset: true },
 };
 </script>
-<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js" async></script>
+<!-- The full build bundles every TeX extension: artifact pages block the runtime fetches a lighter build would make. -->
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-svg-full.js" async></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 <script>
 /* ===== DATA: the single source of truth. Tables, figures and code are drawn from it. ===== */
@@ -386,8 +389,21 @@ function setupChrome() {
   $('#notation-toggle').addEventListener('click', () => { document.body.classList.toggle('mono'); drawFigures(); });
   $('#toc-toggle').addEventListener('click', () => document.body.classList.toggle('toc-open'));
   $$('.copy').forEach(button => button.addEventListener('click', () => {
-    const code = button.closest('.cell').querySelector('pre code').textContent;
-    navigator.clipboard?.writeText(code).then(() => { button.textContent = 'copied'; setTimeout(() => (button.textContent = 'copy'), 1200); });
+    const code = button.closest('.cell').querySelector('pre code');
+    const done = text => { button.textContent = text; setTimeout(() => (button.textContent = 'copy'), 1400); };
+    // Where the clipboard is refused, select the code so the reader can copy it by hand.
+    const select = () => {
+      const range = document.createRange();
+      range.selectNodeContents(code);
+      getSelection().removeAllRanges();
+      getSelection().addRange(range);
+      done('selected');
+    };
+    try {
+      navigator.clipboard.writeText(code.textContent).then(() => done('copied'), select);
+    } catch {
+      select();
+    }
   }));
 }
 
