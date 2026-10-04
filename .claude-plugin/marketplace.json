@@ -90,12 +90,8 @@
     },
     {
       "name": "savvy-flow",
-      "source": {
-        "source": "git-subdir",
-        "url": "https://github.com/JohnnyVizz/claude-kit.git",
-        "path": "plugins/savvy-flow"
-      },
-      "description": "From johnnyvizz/claude-kit: /savvy-flow:savvy-flow <task> plans, delegates to tiered worker subagents (fable, heavy, careful, medium, light) and reviews their work."
+      "source": "./plugins/savvy-flow",
+      "description": "From johnnyvizz/claude-kit, synced daily, with the savvy-fable tier on Opus at max effort: /savvy-flow:savvy-flow <task> plans, delegates to tiered worker subagents and reviews their work."
     },
     {
       "name": "savvy-progress",

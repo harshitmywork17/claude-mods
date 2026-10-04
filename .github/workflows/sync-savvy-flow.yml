@@ -1,0 +1,36 @@
+# Keeps plugins/savvy-flow in step with johnnyvizz/claude-kit, with the savvy-fable tier on Opus.
+# Runs daily and on demand (Actions tab, "Run workflow"); commits only when upstream changed.
+name: Sync savvy-flow
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-savvy-flow
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull upstream and reapply the Opus patch
+        run: tools/sync-savvy-flow.sh
+
+      - name: Commit when something changed
+        run: |
+          if git diff --quiet && [ -z "$(git ls-files --others --exclude-standard plugins/savvy-flow)" ]; then
+            echo "savvy-flow is already up to date"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add plugins/savvy-flow
+          git commit -m "Sync savvy-flow from claude-kit ($(grep -o '"version": "[^"]*"' plugins/savvy-flow/.claude-plugin/plugin.json | cut -d'"' -f4))"
+          git push
