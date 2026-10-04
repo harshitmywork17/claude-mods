@@ -82,6 +82,11 @@
       "name": "crew",
       "source": "./plugins/crew",
       "description": "Agents side pane: each subagent as a pixel crew member with model, effort, context, tokens, cost and time; running, completed and planned tasks with dependencies. /crew"
+    },
+    {
+      "name": "explainer-page",
+      "source": "./plugins/explainer-page",
+      "description": "Textbook-style interactive HTML explainer pages with colour-coded notation, linked figures and tables, and runnable code. Used only when you ask for a visual or interactive explainer page."
     }
   ]
 }

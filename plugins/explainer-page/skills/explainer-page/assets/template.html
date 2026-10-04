@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bigram Joint Distribution</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<!--
+  EXPLAINER PAGE TEMPLATE
+  Keep: the <style> block, the shell (topbar, toc, main), the <script> helpers.
+  Replace: everything inside <main> between the CONTENT markers, the DATA object, and drawFigures().
+  Notation colours (use the same role everywhere: prose, maths, figures, tables, code comments):
+    .in  / \inp{}   input, given, observed          blue
+    .out / \outp{}  output, target, prediction       orange
+    .prm / \prm{}   parameter, weight, learned       green
+    .fn  / \fn{}    function, operator, model        violet
+    .pr  / \pr{}    probability, score, loss value   pink
+-->
+<style>
+:root {
+  --bg: #fbfaf7; --panel: #f2f0ea; --ink: #1f2328; --muted: #5f6670; --rule: #d9d5cc; --hover: #ebe7dd;
+  --in: #1f6feb; --out: #c2610c; --prm: #1a7f55; --fn: #7c4dbd; --pr: #c0306a;
+  --bar: #a9adb4; --bar-side: #8b9098; --bar-top: #c7cad0;
+  --code-bg: #f4f2ec; --kw: #7c4dbd; --str: #1a7f55; --num: #c2610c; --com: #8a8f98;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121418; --panel: #1a1d23; --ink: #e6e3dc; --muted: #9aa0a8; --rule: #2c3038; --hover: #22262e;
+    --in: #6ea8fe; --out: #f0a35e; --prm: #5fd3a0; --fn: #b392f0; --pr: #f27fa0;
+    --bar: #6b7078; --bar-side: #4e535b; --bar-top: #8a8f97;
+    --code-bg: #171a1f; --kw: #b392f0; --str: #5fd3a0; --num: #f0a35e; --com: #6c727b;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #121418; --panel: #1a1d23; --ink: #e6e3dc; --muted: #9aa0a8; --rule: #2c3038; --hover: #22262e;
+  --in: #6ea8fe; --out: #f0a35e; --prm: #5fd3a0; --fn: #b392f0; --pr: #f27fa0;
+  --bar: #6b7078; --bar-side: #4e535b; --bar-top: #8a8f97;
+  --code-bg: #171a1f; --kw: #b392f0; --str: #5fd3a0; --num: #f0a35e; --com: #6c727b;
+}
+/* Notation off: every role reads in the body colour. */
+body.mono { --in: var(--ink); --out: var(--ink); --prm: var(--ink); --fn: var(--ink); --pr: var(--ink); }
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 18px/1.65 "Crimson Pro", Georgia, serif;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--in); }
+code, pre, .mono-font { font-family: "JetBrains Mono", ui-monospace, monospace; }
+
+/* Shell */
+.topbar {
+  position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 12px;
+  padding: 10px 16px; background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(6px); border-bottom: 1px solid var(--rule);
+}
+.topbar h1 { font-size: 19px; font-weight: 600; margin: 0; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.icon-btn {
+  border: 1px solid var(--rule); background: var(--panel); color: var(--muted); border-radius: 6px;
+  font: 13px "JetBrains Mono", monospace; padding: 4px 9px; cursor: pointer;
+}
+.icon-btn:hover { color: var(--ink); }
+.layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); }
+.toc {
+  position: sticky; top: 49px; height: calc(100vh - 49px); overflow-y: auto;
+  padding: 22px 14px 40px 18px; border-right: 1px solid var(--rule); font-size: 15px;
+}
+.toc a { display: block; color: var(--muted); text-decoration: none; padding: 3px 0 3px 10px; border-left: 2px solid transparent; }
+.toc a.h3 { padding-left: 24px; font-size: 14px; }
+.toc a:hover { color: var(--ink); }
+.toc a.active { color: var(--out); border-left-color: var(--out); }
+main { padding: 28px 300px 120px 56px; max-width: 1180px; }
+@media (max-width: 1200px) { main { padding-right: 40px; } }
+@media (max-width: 860px) {
+  .layout { grid-template-columns: minmax(0, 1fr); }
+  .toc { position: fixed; left: 0; top: 49px; width: 270px; background: var(--bg); transform: translateX(-100%); transition: transform .2s; z-index: 9; }
+  body.toc-open .toc { transform: none; }
+  main { padding: 20px 16px 100px; }
+}
+@media (min-width: 861px) { #toc-toggle { display: none; } }
+
+/* Text */
+h2 { font-size: 30px; font-weight: 600; margin: 56px 0 8px; line-height: 1.2; }
+h3 { font-size: 22px; font-weight: 600; margin: 36px 0 6px; }
+h2 .num, h3 .num { color: var(--muted); font-weight: 400; margin-right: 10px; }
+p { margin: 12px 0; }
+.lede { font-size: 21px; color: var(--muted); font-style: italic; }
+.in { color: var(--in); } .out { color: var(--out); } .prm { color: var(--prm); } .fn { color: var(--fn); } .pr { color: var(--pr); }
+.term { font-style: italic; }
+mjx-container[display="true"] { overflow-x: auto; overflow-y: hidden; max-width: 100%; padding: 2px 0; }
+
+/* Margin notes: in the right gutter on wide screens, inline below that. */
+.margin {
+  float: right; clear: right; width: 220px; margin: 4px -260px 12px 0;
+  font-size: 15px; line-height: 1.5; color: var(--muted); border-left: 2px solid var(--rule); padding-left: 10px;
+}
+@media (max-width: 1200px) { .margin { float: none; width: auto; margin: 10px 0; } }
+
+/* Callouts */
+.callout { border-left: 3px solid var(--in); background: var(--panel); border-radius: 0 8px 8px 0; padding: 12px 16px; margin: 22px 0; }
+.callout > .label { font: 600 13px "JetBrains Mono", monospace; letter-spacing: .04em; text-transform: uppercase; color: var(--in); }
+.callout.warning { border-left-color: var(--out); } .callout.warning > .label { color: var(--out); }
+.callout.insight { border-left-color: var(--prm); } .callout.insight > .label { color: var(--prm); }
+.callout.check { border-left-color: var(--fn); } .callout.check > .label { color: var(--fn); }
+.callout details { margin-top: 8px; }
+.callout summary { cursor: pointer; color: var(--muted); font-size: 16px; }
+
+/* Figures */
+figure { margin: 28px 0; }
+.fig-row { display: flex; flex-wrap: wrap; gap: 28px; align-items: center; justify-content: center; }
+.fig-row > * { flex: 1 1 300px; min-width: 0; }
+.scroll-x { overflow-x: auto; max-width: 100%; }
+body { overflow-x: hidden; }
+figcaption { font-size: 15px; color: var(--muted); margin-top: 10px; }
+figcaption b { color: var(--ink); font-weight: 600; }
+svg text { font-family: "JetBrains Mono", monospace; }
+.bar-face { transition: fill .12s; }
+.hot .bar-face.top { fill: var(--out) !important; }
+.hot .bar-face.left, .hot .bar-face.right { fill: color-mix(in srgb, var(--out) 70%, black) !important; }
+
+/* Linked tables */
+table.grid { border-collapse: collapse; font: 14px "JetBrains Mono", monospace; margin: 0 auto; }
+table.grid th { font-weight: 400; color: var(--muted); padding: 4px 8px; }
+table.grid th.in { color: var(--in); } table.grid th.out { color: var(--out); }
+table.grid td { border: 1px solid var(--rule); padding: 6px 10px; text-align: center; cursor: default; }
+table.grid td.hot { outline: 2px solid var(--out); outline-offset: -2px; background: color-mix(in srgb, var(--out) 18%, transparent); }
+table.grid td.total { border-style: dashed; color: var(--muted); }
+
+/* Controls */
+.controls { display: flex; flex-wrap: wrap; gap: 18px; align-items: center; font: 14px "JetBrains Mono", monospace; color: var(--muted); margin: 10px 0; }
+.controls input[type=range] { accent-color: var(--out); width: 160px; vertical-align: middle; }
+.readout { color: var(--ink); min-width: 4ch; display: inline-block; }
+
+/* Code cells */
+.cell { margin: 22px 0; }
+.cell .head { display: flex; justify-content: space-between; font: 12px "JetBrains Mono", monospace; color: var(--muted); padding: 0 2px 4px; }
+.cell pre { margin: 0; background: var(--code-bg); border: 1px solid var(--rule); border-radius: 8px; padding: 14px 16px; overflow-x: auto; font-size: 14px; line-height: 1.55; }
+.cell .out-block { border-top: none; border-radius: 0 0 8px 8px; margin-top: -6px; color: var(--muted); background: var(--panel); }
+.copy { border: none; background: none; color: var(--muted); cursor: pointer; font: inherit; }
+.hljs-keyword, .hljs-built_in { color: var(--kw); } .hljs-string { color: var(--str); }
+.hljs-number, .hljs-literal { color: var(--num); } .hljs-comment { color: var(--com); font-style: italic; }
+.hljs-title, .hljs-title.function_ { color: var(--fn); }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <button class="icon-btn" id="toc-toggle" aria-label="Contents">☰</button>
+  <h1>Bigram Joint Distribution</h1>
+  <button class="icon-btn" id="notation-toggle" title="Colour-coded notation on or off">● notation</button>
+  <button class="icon-btn" id="theme-toggle" title="Light or dark">◐</button>
+</div>
+<div class="layout">
+  <nav class="toc" id="toc" aria-label="Contents"></nav>
+  <main id="main">
+<!-- ===== CONTENT START ===== -->
+
+<p class="lede">A language model has to say how likely a whole sentence is. Start with the smallest sentence that still has order: two words.</p>
+
+<h2 id="problem"><span class="num">1</span>The problem</h2>
+<p>We want one number for every pair of words: how likely is it that the <span class="in">previous word</span> is <span class="in">\(v_i\)</span> and the <span class="out">next word</span> is <span class="out">\(v_j\)</span>? With a vocabulary of five words there are \(5 \times 5 = 25\) such pairs, and their chances must add up to one.</p>
+
+<h2 id="idea"><span class="num">2</span>The idea: a table of chances</h2>
+<aside class="margin">A <span class="term">joint distribution</span> gives the chance of two things happening together, not one after the other.</aside>
+<p>Write the two word positions as random variables <span class="in">\(\inp{W_{t-1}}\)</span> and <span class="out">\(\outp{W_t}\)</span>. Their joint distribution is a function from a pair of indices to a probability:</p>
+\[
+\pr{P_{ij}} \;=\; \fn{p}\big(\inp{W_{t-1}} = \inp{v_i},\; \outp{W_t} = \outp{v_j}\big),
+\qquad \sum_{i}\sum_{j} \pr{P_{ij}} = 1 .
+\]
+<p>Because \(i\) and \(j\) each run over five words, the whole function fits in a \(5 \times 5\) matrix. Hover a cell of the table or a bar of the plot: they are the same number.</p>
+
+<figure id="fig-joint">
+  <div class="fig-row">
+    <svg id="iso" viewBox="0 0 420 300" style="max-height:340px" role="img" aria-label="Bars for each word pair"></svg>
+    <div id="joint-table" class="scroll-x"></div>
+  </div>
+  <figcaption><b>Figure <span class="fig-num"></span>.</b> The joint \(\pr{P_{ij}}\) as bars (left) and as a matrix (right). Rows are the <span class="in">previous word</span>, columns the <span class="out">next word</span>. The dashed column sums each row.</figcaption>
+</figure>
+
+<div class="callout insight"><div class="label">Insight</div>
+The row sums form the distribution of the previous word alone, the <span class="term">marginal</span> \(\fn{p}(\inp{W_{t-1}} = \inp{v_i})\). Here every row sums to <span class="pr">0.20</span>, so on its own each word is equally likely to come first.
+</div>
+
+<h3 id="sharpen"><span class="num">2.1</span>Sharpening the table</h3>
+<p>Raise every entry to a power \(\prm{\tau}\) and renormalise. Larger \(\prm{\tau}\) piles the probability onto the likeliest pair.</p>
+<div class="controls">
+  <label>\(\prm{\tau}\) <input type="range" id="tau" min="0.2" max="4" step="0.1" value="1"> <span class="readout prm" id="tau-out">1.0</span></label>
+  <span>p(to, meet) = <span class="readout pr" id="p-to-meet"></span></span>
+</div>
+
+<h2 id="code"><span class="num">3</span>The same thing in code</h2>
+<div class="cell">
+  <div class="head"><span>In [1]: bigram.py</span><button class="copy">copy</button></div>
+<pre><code class="language-python" id="code-joint"></code></pre>
+<pre class="out-block"><code class="nohighlight" id="code-joint-out"></code></pre>
+</div>
+
+<div class="callout check"><div class="label">Check yourself</div>
+Which pair is most likely, and what is its probability?
+<details><summary>Show answer</summary>The pair <span class="in">to</span> → <span class="out">meet</span>, with <span class="pr">0.16</span> (tied with world → nice).</details>
+</div>
+
+<div class="callout warning"><div class="label">Watch out</div>
+A table of every pair grows as \(|V|^2\). With a real vocabulary of 50,000 words that is 2.5 billion numbers, which is why later models compute these chances instead of storing them.
+</div>
+
+<!-- ===== CONTENT END ===== -->
+  </main>
+</div>
+
+<script>
+window.MathJax = {
+  loader: { load: ['[tex]/html'] },
+  tex: {
+    packages: { '[+]': ['html'] },
+    inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']],
+    macros: {
+      inp: ['\\class{in}{#1}', 1], outp: ['\\class{out}{#1}', 1], prm: ['\\class{prm}{#1}', 1],
+      fn: ['\\class{fn}{#1}', 1], pr: ['\\class{pr}{#1}', 1],
+    },
+  },
+  svg: { fontCache: 'global' },
+  startup: { typeset: true },
+};
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js" async></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>
+/* ===== DATA: the single source of truth. Tables, figures and code are drawn from it. ===== */
+const DATA = {
+  words: ['Hello', 'world', 'nice', 'to', 'meet'],
+  joint: [
+    [0.01, 0.15, 0.01, 0.02, 0.01],
+    [0.01, 0.01, 0.16, 0.01, 0.01],
+    [0.01, 0.01, 0.01, 0.16, 0.01],
+    [0.01, 0.01, 0.01, 0.01, 0.16],
+    [0.14, 0.02, 0.01, 0.02, 0.01],
+  ],
+};
+
+/* ===== Helpers (keep) ===== */
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function svg(tag, attrs = {}, parent) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+  if (parent) parent.appendChild(node);
+  return node;
+}
+const fmt = (x, digits = 2) => Number(x).toFixed(digits);
+
+/** Every element with the same data-key lights up together: hover one, see it everywhere. */
+function linkKeys(root = document) {
+  root.addEventListener('pointerover', event => {
+    const key = event.target.closest('[data-key]')?.dataset.key;
+    $$('.hot').forEach(node => node.classList.remove('hot'));
+    if (key) $$(`[data-key="${key}"]`).forEach(node => node.classList.add('hot'));
+  });
+}
+
+/** A matrix as a table: rows labelled as inputs, columns as outputs, an optional row-sum column. */
+function matrixTable(host, matrix, rowLabels, colLabels, { rowSums = false } = {}) {
+  const head = `<tr><th></th>${colLabels.map(label => `<th class="out">${label}</th>`).join('')}${rowSums ? '<th>Σ<sub>j</sub></th>' : ''}</tr>`;
+  const rows = matrix.map((row, i) =>
+    `<tr><th class="in">${rowLabels[i]}</th>${row.map((value, j) => `<td data-key="${i},${j}">${fmt(value)}</td>`).join('')}` +
+    `${rowSums ? `<td class="total">${fmt(row.reduce((a, b) => a + b, 0))}</td>` : ''}</tr>`).join('');
+  host.innerHTML = `<table class="grid">${head}${rows}</table>`;
+}
+
+/** An isometric 3D bar chart of a matrix, drawn back to front, each bar keyed "i,j"; the view box fits the drawing. */
+function isoBars(host, matrix, rowLabels, colLabels, { cell = 30, tallest = 90 } = {}) {
+  host.innerHTML = '';
+  const rows = matrix.length, cols = matrix[0].length;
+  const cx = Math.cos(Math.PI / 6) * cell, cy = Math.sin(Math.PI / 6) * cell;
+  const at = (i, j, z = 0) => [(j - i) * cx, (i + j) * cy - z];
+  const max = Math.max(...matrix.flat()) || 1;
+  const style = getComputedStyle(document.documentElement);
+  const color = name => style.getPropertyValue(name).trim();
+  const order = [];
+  for (let i = 0; i < rows; i += 1) for (let j = 0; j < cols; j += 1) order.push([i, j]);
+  order.sort((a, b) => a[0] + a[1] - (b[0] + b[1]));
+  const pad = 0.14, a = pad, b = 1 - pad;
+  for (const [i, j] of order) {
+    const z = (matrix[i][j] / max) * tallest + 2;
+    const g = svg('g', { 'data-key': `${i},${j}` }, host);
+    const p = (di, dj, dz) => at(i + di, j + dj, dz).join(',');
+    svg('polygon', { class: 'bar-face left', fill: color('--bar-side'), points: [p(b, a, 0), p(b, b, 0), p(b, b, z), p(b, a, z)].join(' ') }, g);
+    svg('polygon', { class: 'bar-face right', fill: color('--bar'), points: [p(a, b, 0), p(b, b, 0), p(b, b, z), p(a, b, z)].join(' ') }, g);
+    svg('polygon', { class: 'bar-face top', fill: color('--bar-top'), points: [p(a, a, z), p(a, b, z), p(b, b, z), p(b, a, z)].join(' ') }, g);
+    svg('title', {}, g).textContent = `p(${rowLabels[i]}, ${colLabels[j]}) = ${fmt(matrix[i][j])}`;
+  }
+  // Labels run along the two front edges, where no bar can hide them: rows down the right, columns down the left.
+  rowLabels.forEach((label, i) => {
+    const [x, y] = at(i + 0.5, cols + 0.3);
+    svg('text', { x, y: y + 8, 'text-anchor': 'start', 'font-size': 11, fill: color('--in') }, host).textContent = label;
+  });
+  colLabels.forEach((label, j) => {
+    const [x, y] = at(rows + 0.3, j + 0.5);
+    svg('text', { x, y: y + 8, 'text-anchor': 'end', 'font-size': 11, fill: color('--out') }, host).textContent = label;
+  });
+  try {
+    const box = host.getBBox();
+    if (box.width > 0) host.setAttribute('viewBox', `${box.x - 8} ${box.y - 8} ${box.width + 16} ${box.height + 16}`);
+  } catch {
+    // Not laid out yet (hidden): keep the view box the markup gave.
+  }
+}
+
+/**
+ * A diagram of nodes and arrows (a neuron, a pipeline, a computation graph), in its own coordinates.
+ * nodes: [{ id, x, y, label, role: 'in'|'out'|'prm'|'fn'|'pr', r }]; edges: [{ from, to, label, role }].
+ */
+function nodeGraph(host, nodes, edges, { radius = 20 } = {}) {
+  host.innerHTML = '';
+  const style = getComputedStyle(document.documentElement);
+  const tone = role => style.getPropertyValue(`--${role ?? 'fn'}`).trim() || style.getPropertyValue('--ink').trim();
+  const byId = new Map(nodes.map(node => [node.id, node]));
+  const defs = svg('defs', {}, host);
+  const marker = svg('marker', { id: `${host.id}-arrow`, viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse' }, defs);
+  svg('path', { d: 'M0,0 L10,5 L0,10 z', fill: style.getPropertyValue('--muted').trim() }, marker);
+  for (const edge of edges) {
+    const a = byId.get(edge.from), b = byId.get(edge.to);
+    if (!a || !b) continue;
+    const ra = a.r ?? radius, rb = b.r ?? radius;
+    const dx = b.x - a.x, dy = b.y - a.y, length = Math.hypot(dx, dy) || 1;
+    const x1 = a.x + (dx / length) * ra, y1 = a.y + (dy / length) * ra;
+    const x2 = b.x - (dx / length) * (rb + 2), y2 = b.y - (dy / length) * (rb + 2);
+    svg('line', { x1, y1, x2, y2, stroke: style.getPropertyValue('--muted').trim(), 'stroke-width': 1.2, 'marker-end': `url(#${host.id}-arrow)` }, host);
+    if (edge.label) {
+      const t = svg('text', { x: (x1 + x2) / 2, y: (y1 + y2) / 2 - 5, 'text-anchor': 'middle', 'font-size': 11, fill: tone(edge.role ?? 'prm') }, host);
+      t.textContent = edge.label;
+    }
+  }
+  for (const node of nodes) {
+    const r = node.r ?? radius, color = tone(node.role);
+    const g = svg('g', node.key ? { 'data-key': node.key } : {}, host);
+    svg('circle', { cx: node.x, cy: node.y, r, fill: `color-mix(in srgb, ${color} 22%, transparent)`, stroke: color, 'stroke-width': 1.6 }, g);
+    const t = svg('text', { x: node.x, y: node.y + 4, 'text-anchor': 'middle', 'font-size': Math.max(10, r * 0.6), fill: color }, g);
+    t.textContent = node.label ?? '';
+  }
+}
+
+/** Contents built from the h2 and h3 headings, with the section in view marked. */
+function buildToc() {
+  const toc = $('#toc');
+  const heads = $$('main h2[id], main h3[id]');
+  const label = h => {
+    const num = h.querySelector('.num')?.textContent ?? '';
+    const title = h.textContent.slice(num.length).trim();
+    return num === '' ? title : `${num}&nbsp;&nbsp;${title}`;
+  };
+  toc.innerHTML = heads.map(h => `<a href="#${h.id}" class="${h.tagName.toLowerCase()}">${label(h)}</a>`).join('');
+  const links = $$('a', toc);
+  const seen = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      links.forEach(link => link.classList.toggle('active', link.getAttribute('href') === `#${entry.target.id}`));
+    }
+  }, { rootMargin: '0px 0px -70% 0px' });
+  heads.forEach(h => seen.observe(h));
+  toc.addEventListener('click', () => document.body.classList.remove('toc-open'));
+}
+
+/** Figures numbered in order: section number, then position. */
+function numberFigures() {
+  $$('figure').forEach((figure, index) => {
+    const num = $('.fig-num', figure);
+    if (num) num.textContent = String(index + 1);
+  });
+}
+
+function setupChrome() {
+  const saved = (() => { try { return localStorage.getItem('theme'); } catch { return null; } })();
+  if (saved) document.documentElement.dataset.theme = saved;
+  $('#theme-toggle').addEventListener('click', () => {
+    const isDark = document.documentElement.dataset.theme
+      ? document.documentElement.dataset.theme === 'dark'
+      : matchMedia('(prefers-color-scheme: dark)').matches;
+    document.documentElement.dataset.theme = isDark ? 'light' : 'dark';
+    try { localStorage.setItem('theme', document.documentElement.dataset.theme); } catch {}
+    drawFigures();
+  });
+  $('#notation-toggle').addEventListener('click', () => { document.body.classList.toggle('mono'); drawFigures(); });
+  $('#toc-toggle').addEventListener('click', () => document.body.classList.toggle('toc-open'));
+  $$('.copy').forEach(button => button.addEventListener('click', () => {
+    const code = button.closest('.cell').querySelector('pre code').textContent;
+    navigator.clipboard?.writeText(code).then(() => { button.textContent = 'copied'; setTimeout(() => (button.textContent = 'copy'), 1200); });
+  }));
+}
+
+/* ===== Page-specific drawing: replace for each topic ===== */
+function sharpen(matrix, tau) {
+  const raised = matrix.map(row => row.map(value => value ** tau));
+  const total = raised.flat().reduce((a, b) => a + b, 0);
+  return raised.map(row => row.map(value => value / total));
+}
+
+function drawFigures() {
+  const tau = Number($('#tau').value);
+  const joint = sharpen(DATA.joint, tau);
+  isoBars($('#iso'), joint, DATA.words, DATA.words);
+  matrixTable($('#joint-table'), joint, DATA.words, DATA.words, { rowSums: true });
+  $('#tau-out').textContent = fmt(tau, 1);
+  $('#p-to-meet').textContent = fmt(joint[3][4], 3);
+}
+
+function writeCode() {
+  const rows = DATA.joint.map((row, i) => `    [${row.map(v => fmt(v)).join(', ')}],  # previous word = ${DATA.words[i]}`).join('\n');
+  $('#code-joint').textContent =
+`import numpy as np
+
+words = [${DATA.words.map(w => `'${w}'`).join(', ')}]
+# joint[i, j] = p(previous = words[i], next = words[j])
+joint = np.array([
+${rows}
+])
+assert np.isclose(joint.sum(), 1.0)   # one distribution over every pair
+print(joint[3, 4])                    # p(to, meet)
+print(joint.sum(axis=1))              # marginal of the previous word`;
+  // Printed as NumPy prints them (0.2, not 0.20): the output block must match a real run.
+  const npNum = x => String(Number(x.toFixed(8)));
+  const marginal = DATA.joint.map(row => npNum(row.reduce((a, b) => a + b, 0)));
+  $('#code-joint-out').textContent = `${npNum(DATA.joint[3][4])}\n[${marginal.join(' ')}]`;
+}
+
+/* ===== Start ===== */
+setupChrome();
+buildToc();
+numberFigures();
+writeCode();
+drawFigures();
+linkKeys();
+$('#tau').addEventListener('input', drawFigures);
+window.hljs?.highlightAll();
+</script>
+</body>
+</html>
